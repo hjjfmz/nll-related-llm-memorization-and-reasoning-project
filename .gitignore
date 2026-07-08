@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local editor settings
+.vscode/
+
+# Generated experiment outputs
+phase_c_outputs/
+phase_c_runs/
+
+# Documentation and image assets not intended for GitHub
+/docs/
+/images/
