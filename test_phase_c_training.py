@@ -91,6 +91,32 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertEqual(state["step"], 7)
         self.assertEqual(restored_stream.state_dict(), stream.state_dict())
 
+    def test_load_checkpoint_accepts_list_rng_state(self):
+        from phase_c_model import DecoderOnlyTransformer, ModelConfig
+        from phase_c_training import SampleStream, load_checkpoint, save_checkpoint
+
+        config = ModelConfig("test", 1, 16, 4, context_length=16)
+        model = DecoderOnlyTransformer(config, 20)
+        optimizer = torch.optim.AdamW(model.parameters())
+        stream = SampleStream(20, 3)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "checkpoint.pt"
+            save_checkpoint(path, model, optimizer, 7, stream, {"name": "test"})
+            state = torch.load(path, map_location="cpu", weights_only=False)
+            state["torch_rng_state"] = state["torch_rng_state"].tolist()
+            torch.save(state, path)
+
+            restored = DecoderOnlyTransformer(config, 20)
+            restored_optimizer = torch.optim.AdamW(restored.parameters())
+            restored_stream = SampleStream(20, 99)
+            loaded = load_checkpoint(
+                path, restored, restored_optimizer, restored_stream, "cpu"
+            )
+
+        self.assertEqual(loaded["step"], 7)
+        self.assertEqual(restored_stream.state_dict(), stream.state_dict())
+
 
 if __name__ == "__main__":
     unittest.main()

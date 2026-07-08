@@ -247,6 +247,18 @@ def save_checkpoint(
     os.replace(temp_path, path)
 
 
+def _coerce_rng_state(state: object) -> torch.Tensor:
+    if isinstance(state, torch.Tensor):
+        return state.to(dtype=torch.uint8, device="cpu")
+    return torch.tensor(state, dtype=torch.uint8)
+
+
+def _coerce_cuda_rng_state_all(states: object) -> list[torch.Tensor]:
+    if not isinstance(states, (list, tuple)):
+        raise TypeError("cuda_rng_state_all must be a sequence")
+    return [_coerce_rng_state(state) for state in states]
+
+
 def load_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -261,8 +273,10 @@ def load_checkpoint(
     if scheduler is not None and state["scheduler"] is not None:
         scheduler.load_state_dict(state["scheduler"])
     stream.load_state_dict(state["stream"])
-    torch.set_rng_state(state["torch_rng_state"])
+    torch.set_rng_state(_coerce_rng_state(state["torch_rng_state"]))
     random.setstate(state["python_rng_state"])
     if torch.cuda.is_available() and "cuda_rng_state_all" in state:
-        torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+        torch.cuda.set_rng_state_all(
+            _coerce_cuda_rng_state_all(state["cuda_rng_state_all"])
+        )
     return {"step": int(state["step"]), "run_config": state["run_config"]}
