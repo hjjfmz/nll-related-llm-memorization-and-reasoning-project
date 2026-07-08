@@ -95,7 +95,7 @@ class SampleStream:
             multiplier = multiplier % self.size + 1
         return multiplier, rng.randrange(self.size)
 
-    def next_ids(self, count: int) -> list[int]:
+    def _next_global_ids(self, count: int) -> list[int]:
         if count <= 0:
             raise ValueError("count must be positive")
         result = []
@@ -111,6 +111,19 @@ class SampleStream:
                 self.epoch += 1
                 self.position = 0
         return result
+
+    def next_ids(self, count: int) -> list[int]:
+        return self._next_global_ids(count)
+
+    def next_ids_for_rank(self, count: int, rank: int, world_size: int) -> list[int]:
+        if world_size <= 0:
+            raise ValueError("world_size must be positive")
+        if not 0 <= rank < world_size:
+            raise ValueError("rank must be in [0, world_size)")
+        global_ids = self._next_global_ids(count * world_size)
+        start = rank * count
+        end = start + count
+        return global_ids[start:end]
 
     def state_dict(self) -> dict[str, int]:
         return {

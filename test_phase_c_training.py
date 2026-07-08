@@ -7,6 +7,36 @@ import torch
 
 
 class ModelAndTrainingTests(unittest.TestCase):
+    def test_sample_stream_shards_ids_by_rank_without_overlap(self):
+        from phase_c_training import SampleStream
+
+        stream = SampleStream(12, 7)
+        rank0 = stream.next_ids_for_rank(count=2, rank=0, world_size=2)
+        rank1 = stream.next_ids_for_rank(count=2, rank=1, world_size=2)
+        self.assertEqual(len(rank0), 2)
+        self.assertEqual(len(rank1), 2)
+        self.assertTrue(set(rank0).isdisjoint(rank1))
+        self.assertEqual(stream.position, 8)
+
+        stream = SampleStream(5, 11)
+        first_rank0 = stream.next_ids_for_rank(count=1, rank=0, world_size=2)
+        first_rank1 = stream.next_ids_for_rank(count=1, rank=1, world_size=2)
+        second_rank0 = stream.next_ids_for_rank(count=1, rank=0, world_size=2)
+        second_rank1 = stream.next_ids_for_rank(count=1, rank=1, world_size=2)
+        self.assertTrue(set(first_rank0).isdisjoint(first_rank1))
+        self.assertTrue(set(second_rank0).isdisjoint(second_rank1))
+
+    def test_sample_stream_rejects_invalid_rank_configuration(self):
+        from phase_c_training import SampleStream
+
+        stream = SampleStream(10, 5)
+        with self.assertRaises(ValueError):
+            stream.next_ids_for_rank(count=1, rank=-1, world_size=2)
+        with self.assertRaises(ValueError):
+            stream.next_ids_for_rank(count=1, rank=2, world_size=2)
+        with self.assertRaises(ValueError):
+            stream.next_ids_for_rank(count=1, rank=0, world_size=0)
+
     def test_120m_parameter_scale_and_tied_weights(self):
         from phase_c_data import total_vocab_size
         from phase_c_model import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
