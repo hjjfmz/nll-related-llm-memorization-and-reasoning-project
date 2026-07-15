@@ -8,7 +8,10 @@ __pycache__/
 # Generated experiment outputs
 phase_c_outputs/
 phase_c_runs/
+phase_c_random_data/
 
 # Documentation and image assets not intended for GitHub
 /docs/
 /images/
+
+随机序列容量实验重构计划.md

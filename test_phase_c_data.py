@@ -171,6 +171,37 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual([row["sample_id"] for row in rows], list(range(7)))
 
 
+class RandomUnitDatasetTests(unittest.TestCase):
+    def test_random_unit_paths_select_prefix_units(self):
+        from phase_c_data import random_unit_paths
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train = root / "train"
+            train.mkdir()
+            for index in range(1, 6):
+                (train / f"{index}.jsonl.gz").write_bytes(b"placeholder")
+
+            paths = random_unit_paths(root, "train", units=3)
+
+        self.assertEqual(
+            [path.name for path in paths],
+            ["1.jsonl.gz", "2.jsonl.gz", "3.jsonl.gz"],
+        )
+
+    def test_random_unit_paths_reject_missing_unit(self):
+        from phase_c_data import random_unit_paths
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train = root / "train"
+            train.mkdir()
+            (train / "1.jsonl.gz").write_bytes(b"placeholder")
+
+            with self.assertRaises(FileNotFoundError):
+                random_unit_paths(root, "train", units=2)
+
+
 class CliTests(unittest.TestCase):
     def test_preview_cli_prints_parseable_dag_record(self):
         command = [
@@ -205,6 +236,45 @@ class CliTests(unittest.TestCase):
         record = json.loads(result.stdout)
         self.assertEqual(record["family"], "dag")
         self.assertEqual(record["answer_length"], 2)
+
+    def test_random_units_cli_writes_simple_train_and_test_folders(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            command = [
+                sys.executable,
+                "generate_phase_c_data.py",
+                "random-units",
+                "--V",
+                "32",
+                "--S",
+                "6",
+                "--q",
+                "4",
+                "--unit-size",
+                "3",
+                "--train-units",
+                "2",
+                "--test-units",
+                "1",
+                "--base-seed",
+                "1234",
+                "--output-dir",
+                temp_dir,
+            ]
+            result = subprocess.run(
+                command,
+                cwd=Path(__file__).resolve().parent,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            root = Path(temp_dir)
+            self.assertTrue((root / "train" / "1.jsonl.gz").exists())
+            self.assertTrue((root / "train" / "2.jsonl.gz").exists())
+            self.assertTrue((root / "test" / "1.jsonl.gz").exists())
+            self.assertTrue((root / "dataset_manifest.json").exists())
 
 
 if __name__ == "__main__":

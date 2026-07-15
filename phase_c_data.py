@@ -810,5 +810,17 @@ def read_jsonl_gzip(path: Path) -> Iterator[dict]:
                 yield json.loads(line)
 
 
+def random_unit_paths(dataset_root: Path, split: str, units: int) -> list[Path]:
+    _validate_split(split)
+    if units <= 0:
+        raise ValueError("units must be positive")
+    split_dir = Path(dataset_root) / split
+    paths = [split_dir / f"{index}.jsonl.gz" for index in range(1, units + 1)]
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"missing random unit file: {missing[0]}")
+    return paths
+
+
 def config_to_dict(config: RandomConfig | DagConfig) -> dict:
     return asdict(config)

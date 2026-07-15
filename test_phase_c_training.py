@@ -1,4 +1,6 @@
 import math
+import gzip
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,17 +39,100 @@ class ModelAndTrainingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             stream.next_ids_for_rank(count=1, rank=0, world_size=0)
 
-    def test_120m_parameter_scale_and_tied_weights(self):
+    def test_120m_legacy_parameter_scale_and_tied_weights(self):
         from phase_c_data import total_vocab_size
         from phase_c_model import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
 
         model = DecoderOnlyTransformer(
-            MODEL_PRESETS["120m"], total_vocab_size(1024)
+            MODEL_PRESETS["120m_legacy"], total_vocab_size(1024)
         )
         counts = count_parameters(model)
         self.assertGreaterEqual(counts["non_embedding"], 110_000_000)
         self.assertLessEqual(counts["non_embedding"], 125_000_000)
         self.assertIs(model.lm_head.weight, model.token_embedding.weight)
+
+    def test_paper_style_model_presets_are_available_and_bounded(self):
+        from phase_c_model import MODEL_PRESETS
+
+        expected = {
+            "L1_H32",
+            "L1_H64",
+            "L1_H128",
+            "L1_H256",
+            "L2_H32",
+            "L2_H64",
+            "L2_H128",
+            "L2_H256",
+            "L4_H32",
+            "L4_H64",
+            "L4_H128",
+            "L4_H256",
+            "L8_H32",
+            "L8_H64",
+            "L8_H128",
+            "L8_H256",
+            "L16_H32",
+            "L16_H64",
+            "L16_H128",
+            "L16_H256",
+        }
+
+        self.assertTrue(expected.issubset(MODEL_PRESETS))
+        self.assertNotIn("350m", MODEL_PRESETS)
+        self.assertNotIn("700m", MODEL_PRESETS)
+        self.assertNotIn("1b", MODEL_PRESETS)
+        self.assertEqual(MODEL_PRESETS["L4_H128"].n_layers, 4)
+        self.assertEqual(MODEL_PRESETS["L4_H128"].hidden_size, 128)
+        self.assertEqual(MODEL_PRESETS["L4_H128"].n_heads, 2)
+
+    def test_file_random_record_dataset_reads_units_in_prefix_order(self):
+        from phase_c_data import RandomConfig, generate_random_record
+        from phase_c_training import FileRandomRecordDataset
+
+        config = RandomConfig(V=32, S=6, q=4)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train = root / "train"
+            train.mkdir()
+            for unit_index in range(1, 3):
+                path = train / f"{unit_index}.jsonl.gz"
+                with gzip.open(path, "wt", encoding="utf-8", newline="\n") as handle:
+                    start = (unit_index - 1) * 3
+                    for sample_id in range(start, start + 3):
+                        record = generate_random_record(config, "train", sample_id, 99)
+                        handle.write(json.dumps(record, ensure_ascii=False))
+                        handle.write("\n")
+
+            dataset = FileRandomRecordDataset(root, "train", units=2)
+
+            self.assertEqual(len(dataset), 6)
+            self.assertEqual(dataset[0]["sample_id"], 0)
+            self.assertEqual(dataset[5]["sample_id"], 5)
+            self.assertEqual(dataset.config, config)
+            with self.assertRaises(IndexError):
+                _ = dataset[6]
+
+    def test_train_parser_accepts_random_unit_dataset_arguments(self):
+        from train_phase_c_random import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--model",
+                "L4_H128",
+                "--dataset-root",
+                "phase_c_random_data/V1024_S32_q4_seed20260715",
+                "--train-units",
+                "5",
+                "--test-units",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.model, "L4_H128")
+        self.assertEqual(args.train_units, 5)
+        self.assertEqual(args.test_units, 2)
+        self.assertEqual(args.dataset_root.parts[-1], "V1024_S32_q4_seed20260715")
 
     def test_answer_only_labels_and_capacity_formula(self):
         from phase_c_data import RandomConfig, generate_random_record, special_tokens

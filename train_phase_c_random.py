@@ -18,6 +18,7 @@ from phase_c_data import RandomConfig, special_tokens, total_vocab_size
 from phase_c_model import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
 from phase_c_training import (
     AnswerOnlyCollator,
+    FileRandomRecordDataset,
     RandomRecordDataset,
     SampleStream,
     causal_lm_loss,
@@ -43,13 +44,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="From-scratch random-sequence capacity pretraining."
     )
-    parser.add_argument("--model", choices=tuple(MODEL_PRESETS), default="120m")
+    parser.add_argument("--model", choices=tuple(MODEL_PRESETS), default="L4_H128")
     parser.add_argument("--V", type=int, default=1024)
-    parser.add_argument("--S", type=int, default=384)
+    parser.add_argument("--S", type=int, default=32)
     parser.add_argument("--q", type=int, default=4)
     parser.add_argument("--key-seed", type=int, default=0)
     parser.add_argument("--train-size", type=int, default=100_000)
     parser.add_argument("--validation-size", type=int, default=10_000)
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=None,
+        help="Read fixed random units from this root instead of online generation.",
+    )
+    parser.add_argument(
+        "--train-units",
+        type=int,
+        default=None,
+        help="Number of 1k train unit files to read from dataset-root/train.",
+    )
+    parser.add_argument(
+        "--test-units",
+        type=int,
+        default=None,
+        help="Number of 1k test unit files to read from dataset-root/test.",
+    )
     parser.add_argument("--train-seed", type=int, default=20270616)
     parser.add_argument("--validation-seed", type=int, default=20270617)
     parser.add_argument("--sampling-seed", type=int, default=20270618)
@@ -85,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("phase_c_runs/random_120m_N100k"),
+        default=Path("phase_c_runs/random_L4_H128_units"),
     )
     return parser
 
@@ -206,6 +225,28 @@ def _build_run_config(args: argparse.Namespace, context: DistributedContext, max
     }
 
 
+def _build_datasets(
+    args: argparse.Namespace,
+) -> tuple[RandomRecordDataset | FileRandomRecordDataset, RandomRecordDataset | FileRandomRecordDataset, RandomConfig]:
+    if args.dataset_root is None:
+        data_config = RandomConfig(args.V, args.S, args.q, args.key_seed)
+        train_dataset = RandomRecordDataset(
+            data_config, "train", args.train_size, args.train_seed
+        )
+        test_dataset = RandomRecordDataset(
+            data_config, "test", args.validation_size, args.validation_seed
+        )
+        return train_dataset, test_dataset, data_config
+
+    if args.train_units is None or args.test_units is None:
+        raise ValueError("dataset-root requires both --train-units and --test-units")
+    train_dataset = FileRandomRecordDataset(args.dataset_root, "train", args.train_units)
+    test_dataset = FileRandomRecordDataset(args.dataset_root, "test", args.test_units)
+    if train_dataset.config != test_dataset.config:
+        raise ValueError("train and test file-backed datasets have different configs")
+    return train_dataset, test_dataset, train_dataset.config
+
+
 def run(args: argparse.Namespace) -> dict | None:
     context = _distributed_context()
     device = _resolve_device(args.device, context)
@@ -223,22 +264,16 @@ def run(args: argparse.Namespace) -> dict | None:
             torch.set_float32_matmul_precision("high")
             torch.cuda.reset_peak_memory_stats(device)
 
-        data_config = RandomConfig(args.V, args.S, args.q, args.key_seed)
+        train_dataset, test_dataset, data_config = _build_datasets(args)
         model_config = MODEL_PRESETS[args.model]
-        sequence_length = 3 + args.q + 1 + args.S + 1
+        sequence_length = 3 + data_config.q + 1 + data_config.S + 1
         if sequence_length > model_config.context_length:
             raise ValueError("data sequence exceeds model context length")
 
-        train_dataset = RandomRecordDataset(
-            data_config, "train", args.train_size, args.train_seed
-        )
-        validation_dataset = RandomRecordDataset(
-            data_config, "validation", args.validation_size, args.validation_seed
-        )
-        collator = AnswerOnlyCollator(special_tokens(args.V)["PAD"])
+        collator = AnswerOnlyCollator(special_tokens(data_config.V)["PAD"])
         stream = SampleStream(len(train_dataset), args.sampling_seed)
         base_model = DecoderOnlyTransformer(
-            model_config, total_vocab_size(args.V)
+            model_config, total_vocab_size(data_config.V)
         ).to(device)
         base_model.set_gradient_checkpointing(not args.no_gradient_checkpointing)
         parameter_counts = count_parameters(base_model)
@@ -254,7 +289,7 @@ def run(args: argparse.Namespace) -> dict | None:
 
         per_rank_effective_batch = args.micro_batch_size * args.gradient_accumulation
         global_effective_batch = per_rank_effective_batch * context.world_size
-        steps_per_epoch = math.ceil(args.train_size / global_effective_batch)
+        steps_per_epoch = math.ceil(len(train_dataset) / global_effective_batch)
         max_steps = args.max_steps or args.epochs * steps_per_epoch
         minimum_ratio = args.minimum_learning_rate / args.learning_rate
         scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -407,9 +442,9 @@ def run(args: argparse.Namespace) -> dict | None:
             parameter_counts["non_embedding"],
             args.eval_size,
         )
-        validation_metrics = evaluate_random_model(
+        test_metrics = evaluate_random_model(
             _unwrap_model(model),
-            validation_dataset,
+            test_dataset,
             collator,
             args.eval_batch_size,
             device,
@@ -420,7 +455,7 @@ def run(args: argparse.Namespace) -> dict | None:
         metrics = {
             "completed_steps": completed_steps,
             "train": train_metrics,
-            "validation": validation_metrics,
+            "test": test_metrics,
             "parameters": parameter_counts,
             "formal_capacity_evaluation": train_metrics["samples"]
             == len(train_dataset),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import itertools
 import json
 import os
@@ -57,6 +59,24 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--shard-size", type=int, default=100_000)
     write.add_argument("--compression-level", type=int, default=6)
     write.add_argument("--output-dir", type=Path, required=True)
+
+    random_units = subparsers.add_parser(
+        "random-units",
+        help="write fixed-size random train/test unit files",
+    )
+    random_units.add_argument("--V", type=int, default=1024)
+    random_units.add_argument("--S", type=int, default=32)
+    random_units.add_argument("--q", type=int, default=4)
+    random_units.add_argument("--key-seed", type=int, default=0)
+    random_units.add_argument("--unit-size", type=int, default=1_000)
+    random_units.add_argument("--train-units", type=int, required=True)
+    random_units.add_argument("--test-units", type=int, required=True)
+    random_units.add_argument("--base-seed", type=int, default=20260715)
+    random_units.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("phase_c_random_data/V1024_S32_q4_seed20260715"),
+    )
     return parser
 
 
@@ -103,6 +123,52 @@ def _atomic_write_json(path: Path, value: object) -> None:
         encoding="utf-8",
     )
     os.replace(temp_path, path)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_random_unit_file(
+    path: Path,
+    config: RandomConfig,
+    split: str,
+    unit_index: int,
+    unit_size: int,
+    seed: int,
+) -> dict:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start_id = (unit_index - 1) * unit_size
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with gzip.open(
+        temp_path,
+        mode="wt",
+        encoding="utf-8",
+        newline="\n",
+        compresslevel=6,
+    ) as handle:
+        for record in generate_records(
+            "random",
+            config,
+            split,
+            unit_size,
+            seed,
+            start_id=start_id,
+        ):
+            handle.write(json.dumps(record, ensure_ascii=False))
+            handle.write("\n")
+    os.replace(temp_path, path)
+    return {
+        "name": path.name,
+        "records": unit_size,
+        "start_id": start_id,
+        "end_id": start_id + unit_size - 1,
+        "sha256": _sha256(path),
+    }
 
 
 def command_preview(args: argparse.Namespace) -> int:
@@ -222,6 +288,70 @@ def command_write(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_random_units(args: argparse.Namespace) -> int:
+    if args.unit_size <= 0:
+        raise ValueError("unit-size must be positive")
+    if args.train_units <= 0 or args.test_units <= 0:
+        raise ValueError("train-units and test-units must be positive")
+
+    config = RandomConfig(V=args.V, S=args.S, q=args.q, key_seed=args.key_seed)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    split_units = {
+        "train": args.train_units,
+        "test": args.test_units,
+    }
+    split_seeds = {
+        "train": _seed(args.base_seed, "random", "train"),
+        "test": _seed(args.base_seed, "random", "test"),
+    }
+    files: dict[str, list[dict]] = {"train": [], "test": []}
+    for split, units in split_units.items():
+        split_dir = args.output_dir / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for unit_index in range(1, units + 1):
+            files[split].append(
+                _write_random_unit_file(
+                    split_dir / f"{unit_index}.jsonl.gz",
+                    config,
+                    split,
+                    unit_index,
+                    args.unit_size,
+                    split_seeds[split],
+                )
+            )
+
+    manifest = {
+        "family": "random",
+        "config": config_to_dict(config),
+        "unit_size": args.unit_size,
+        "base_seed": args.base_seed,
+        "split_seeds": split_seeds,
+        "splits": {
+            split: {
+                "units": split_units[split],
+                "records": split_units[split] * args.unit_size,
+                "files": files[split],
+            }
+            for split in split_units
+        },
+    }
+    manifest_path = args.output_dir / "dataset_manifest.json"
+    _atomic_write_json(manifest_path, manifest)
+    print(
+        json.dumps(
+            {
+                "dataset_root": str(args.output_dir.resolve()),
+                "manifest": str(manifest_path.resolve()),
+                "train_records": manifest["splits"]["train"]["records"],
+                "test_records": manifest["splits"]["test"]["records"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -229,6 +359,7 @@ def main() -> int:
         "preview": command_preview,
         "validate": command_validate,
         "write": command_write,
+        "random-units": command_random_units,
     }
     try:
         return commands[args.command](args)

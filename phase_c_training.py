@@ -11,7 +11,12 @@ from typing import Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
-from phase_c_data import RandomConfig, generate_random_record
+from phase_c_data import (
+    RandomConfig,
+    generate_random_record,
+    random_unit_paths,
+    read_jsonl_gzip,
+)
 
 
 @dataclass
@@ -77,6 +82,33 @@ class RandomRecordDataset:
         return generate_random_record(
             self.config, self.split, sample_id=index, seed=self.seed
         )
+
+
+class FileRandomRecordDataset:
+    def __init__(self, dataset_root: Path, split: str, units: int) -> None:
+        self.dataset_root = Path(dataset_root)
+        self.split = split
+        self.units = units
+        self.paths = random_unit_paths(self.dataset_root, split, units)
+        self.records: list[dict] = []
+        for path in self.paths:
+            self.records.extend(read_jsonl_gzip(path))
+        if not self.records:
+            raise ValueError("file-backed dataset must not be empty")
+        first = self.records[0]
+        self.config = RandomConfig(
+            V=int(first["V"]),
+            S=int(first["answer_length"]),
+            q=len(first["metadata"]["key"]),
+        )
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> dict:
+        if not 0 <= index < len(self.records):
+            raise IndexError(index)
+        return self.records[index]
 
 
 class SampleStream:
