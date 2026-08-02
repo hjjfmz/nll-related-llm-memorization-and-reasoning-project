@@ -10,12 +10,14 @@
 
 ## 主要文件
 
-- `phase_c_data.py`：Phase C 数据生成、解析、校验和准入检查的核心实现。
-- `generate_phase_c_data.py`：数据预览、准入验证、写出 `.jsonl.gz` shard 的 CLI。
-- `phase_c_model.py`：decoder-only Transformer 及模型规模 preset。
-- `phase_c_training.py`：answer-only collation、容量指标、流式样本、checkpoint 保存和恢复。
-- `train_phase_c_random.py`：随机序列容量实验训练入口。除非用户明确批准，不要自动执行训练。
-- `test_phase_c_data.py`、`test_phase_c_training.py`：当前轻量回归测试。
+- `phase_c/data/core.py`：Phase C 数据生成、解析、校验和准入检查的核心实现。
+- `phase_c/data/cli.py`：数据预览、准入验证、写出 `.jsonl.gz` shard 的 CLI。
+- `phase_c/models/`：decoder-only Transformer、模型规模 preset 与参数统计。
+- `phase_c/training/`：answer-only collation、容量指标、流式样本、checkpoint 保存和恢复。
+- `phase_c/experiments/e03_random_capacity/`：实验 3，随机序列容量标定（含 `train.py` 训练入口、`config.py`、`commands.py`、`reporting.py`）。除非用户明确批准，不要自动执行训练。
+- `phase_c/experiments/e04_dag_reasoning/`：实验 4，纯 DAG 推理极限测量（骨架占位，待实现）。
+- `phase_c/experiments/e05_unified_analysis/`：实验 5，统一账本分析（骨架占位，待实现）。
+- `phase_c/tests/`：当前轻量回归测试与结构测试。
 - `phase_c_outputs/`：已生成或验证过的输出。新增结果必须清楚标注阶段和配置。
 
 ## 工作原则
@@ -77,19 +79,19 @@ DAG 序列格式：
 运行单元测试：
 
 ```powershell
-python -m unittest test_phase_c_data.py test_phase_c_training.py
+python -m unittest discover -s phase_c/tests -p "test_*.py"
 ```
 
 预览一个 DAG 样本：
 
 ```powershell
-python generate_phase_c_data.py preview --family dag --V 128 --L 2 --d 2 --W 4 --sample-id 3 --seed 7
+python -m phase_c.data.cli preview --family dag --V 128 --L 2 --d 2 --W 4 --sample-id 3 --seed 7
 ```
 
 小规模准入验证：
 
 ```powershell
-python generate_phase_c_data.py validate --family both --train-size 100 --validation-size 50 --test-size 50 --output-dir phase_c_outputs/admission_smoke
+python -m phase_c.data.cli validate --family both --train-size 100 --validation-size 50 --test-size 50 --output-dir phase_c_outputs/admission_smoke
 ```
 
 Windows 注意事项：
@@ -106,4 +108,3 @@ Windows 注意事项：
 - 是否没有启动未经批准的训练或长任务。
 - 是否说明了已运行和未运行的验证。
 - 如果产生新输出，是否写清楚配置、seed、split、样本规模和结果阶段。
-

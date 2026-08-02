@@ -9,8 +9,26 @@ import torch
 
 
 class ModelAndTrainingTests(unittest.TestCase):
+    def test_training_package_exposes_core_components(self):
+        from phase_c.training.checkpoint import load_checkpoint, save_checkpoint
+        from phase_c.training.collation import AnswerOnlyCollator
+        from phase_c.training.datasets import FileRandomRecordDataset, RandomRecordDataset
+        from phase_c.training.evaluation import evaluate_random_model, random_capacity_metrics
+        from phase_c.training.losses import causal_lm_loss
+        from phase_c.training.stream import SampleStream
+
+        self.assertIsNotNone(AnswerOnlyCollator)
+        self.assertIsNotNone(RandomRecordDataset)
+        self.assertIsNotNone(FileRandomRecordDataset)
+        self.assertIsNotNone(SampleStream)
+        self.assertIsNotNone(causal_lm_loss)
+        self.assertIsNotNone(random_capacity_metrics)
+        self.assertIsNotNone(evaluate_random_model)
+        self.assertIsNotNone(save_checkpoint)
+        self.assertIsNotNone(load_checkpoint)
+
     def test_sample_stream_shards_ids_by_rank_without_overlap(self):
-        from phase_c_training import SampleStream
+        from phase_c.training import SampleStream
 
         stream = SampleStream(12, 7)
         rank0 = stream.next_ids_for_rank(count=2, rank=0, world_size=2)
@@ -29,7 +47,7 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertTrue(set(second_rank0).isdisjoint(second_rank1))
 
     def test_sample_stream_rejects_invalid_rank_configuration(self):
-        from phase_c_training import SampleStream
+        from phase_c.training import SampleStream
 
         stream = SampleStream(10, 5)
         with self.assertRaises(ValueError):
@@ -40,8 +58,8 @@ class ModelAndTrainingTests(unittest.TestCase):
             stream.next_ids_for_rank(count=1, rank=0, world_size=0)
 
     def test_120m_legacy_parameter_scale_and_tied_weights(self):
-        from phase_c_data import total_vocab_size
-        from phase_c_model import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
+        from phase_c.data.core import total_vocab_size
+        from phase_c.models import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
 
         model = DecoderOnlyTransformer(
             MODEL_PRESETS["120m_legacy"], total_vocab_size(1024)
@@ -52,7 +70,7 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertIs(model.lm_head.weight, model.token_embedding.weight)
 
     def test_paper_style_model_presets_are_available_and_bounded(self):
-        from phase_c_model import MODEL_PRESETS
+        from phase_c.models import MODEL_PRESETS
 
         expected = {
             "L1_H32",
@@ -86,8 +104,8 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertEqual(MODEL_PRESETS["L4_H128"].n_heads, 2)
 
     def test_file_random_record_dataset_reads_units_in_prefix_order(self):
-        from phase_c_data import RandomConfig, generate_random_record
-        from phase_c_training import FileRandomRecordDataset
+        from phase_c.data.core import RandomConfig, generate_random_record
+        from phase_c.training import FileRandomRecordDataset
 
         config = RandomConfig(V=32, S=6, q=4)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -113,7 +131,7 @@ class ModelAndTrainingTests(unittest.TestCase):
                 _ = dataset[6]
 
     def test_train_parser_accepts_random_unit_dataset_arguments(self):
-        from train_phase_c_random import build_parser
+        from phase_c.experiments.e03_random_capacity.train import build_parser
 
         parser = build_parser()
         args = parser.parse_args(
@@ -135,8 +153,8 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertEqual(args.dataset_root.parts[-1], "V1024_S32_q4_seed20260715")
 
     def test_answer_only_labels_and_capacity_formula(self):
-        from phase_c_data import RandomConfig, generate_random_record, special_tokens
-        from phase_c_training import AnswerOnlyCollator, random_capacity_metrics
+        from phase_c.data.core import RandomConfig, generate_random_record, special_tokens
+        from phase_c.training import AnswerOnlyCollator, random_capacity_metrics
 
         record = generate_random_record(RandomConfig(V=32, S=6, q=4), "train", 0, 9)
         batch = AnswerOnlyCollator(special_tokens(32)["PAD"])([record])
@@ -156,8 +174,8 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["bits_per_parameter"], 6)
 
     def test_checkpoint_round_trip(self):
-        from phase_c_model import DecoderOnlyTransformer, ModelConfig
-        from phase_c_training import SampleStream, load_checkpoint, save_checkpoint
+        from phase_c.models import DecoderOnlyTransformer, ModelConfig
+        from phase_c.training import SampleStream, load_checkpoint, save_checkpoint
 
         config = ModelConfig("test", 1, 16, 4, context_length=16)
         model = DecoderOnlyTransformer(config, 20)
@@ -177,8 +195,8 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertEqual(restored_stream.state_dict(), stream.state_dict())
 
     def test_load_checkpoint_accepts_list_rng_state(self):
-        from phase_c_model import DecoderOnlyTransformer, ModelConfig
-        from phase_c_training import SampleStream, load_checkpoint, save_checkpoint
+        from phase_c.models import DecoderOnlyTransformer, ModelConfig
+        from phase_c.training import SampleStream, load_checkpoint, save_checkpoint
 
         config = ModelConfig("test", 1, 16, 4, context_length=16)
         model = DecoderOnlyTransformer(config, 20)
