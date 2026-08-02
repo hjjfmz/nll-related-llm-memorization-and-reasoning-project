@@ -1,66 +1,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-
-@dataclass(frozen=True)
-class ModelConfig:
-    name: str
-    n_layers: int
-    hidden_size: int
-    n_heads: int
-    context_length: int = 512
-    mlp_ratio: int = 4
-    dropout: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.n_layers <= 0:
-            raise ValueError("n_layers must be positive")
-        if self.hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if self.n_heads <= 0 or self.hidden_size % self.n_heads:
-            raise ValueError("n_heads must evenly divide hidden_size")
-        if self.context_length <= 0:
-            raise ValueError("context_length must be positive")
-        if self.mlp_ratio <= 0:
-            raise ValueError("mlp_ratio must be positive")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout must be in [0, 1)")
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-MODEL_PRESETS = {
-    "debug": ModelConfig("debug", 2, 64, 1),
-    "L1_H32": ModelConfig("L1_H32", 1, 32, 1),
-    "L1_H64": ModelConfig("L1_H64", 1, 64, 1),
-    "L1_H128": ModelConfig("L1_H128", 1, 128, 2),
-    "L1_H256": ModelConfig("L1_H256", 1, 256, 4),
-    "L2_H32": ModelConfig("L2_H32", 2, 32, 1),
-    "L2_H64": ModelConfig("L2_H64", 2, 64, 1),
-    "L2_H128": ModelConfig("L2_H128", 2, 128, 2),
-    "L2_H256": ModelConfig("L2_H256", 2, 256, 4),
-    "L4_H32": ModelConfig("L4_H32", 4, 32, 1),
-    "L4_H64": ModelConfig("L4_H64", 4, 64, 1),
-    "L4_H128": ModelConfig("L4_H128", 4, 128, 2),
-    "L4_H256": ModelConfig("L4_H256", 4, 256, 4),
-    "L8_H32": ModelConfig("L8_H32", 8, 32, 1),
-    "L8_H64": ModelConfig("L8_H64", 8, 64, 1),
-    "L8_H128": ModelConfig("L8_H128", 8, 128, 2),
-    "L8_H256": ModelConfig("L8_H256", 8, 256, 4),
-    "L16_H32": ModelConfig("L16_H32", 16, 32, 1),
-    "L16_H64": ModelConfig("L16_H64", 16, 64, 1),
-    "L16_H128": ModelConfig("L16_H128", 16, 128, 2),
-    "L16_H256": ModelConfig("L16_H256", 16, 256, 4),
-    "120m_legacy": ModelConfig("120m_legacy", 12, 896, 14),
-}
+from phase_c.models.config import ModelConfig
 
 
 class CausalSelfAttention(nn.Module):
@@ -82,13 +29,19 @@ class CausalSelfAttention(nn.Module):
             ).transpose(1, 2)
 
         query, key, value = map(split_heads, (query, key, value))
-        attended = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
+
+        # Manual attention to work around RTX 4060 SDPA kernel bug with
+        # multi-head configurations.  Equivalent to:
+        #   F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=...)
+        scale = self.head_dim**-0.5
+        attn_weight = query @ key.transpose(-2, -1) * scale
+        attn_weight = attn_weight + torch.triu(
+            torch.full_like(attn_weight, float("-inf")), diagonal=1
         )
+        attn_weight = F.softmax(attn_weight, dim=-1)
+        attn_weight = F.dropout(attn_weight, p=self.dropout, training=self.training)
+        attended = attn_weight @ value
+
         attended = attended.transpose(1, 2).contiguous().view(
             batch_size, sequence_length, hidden_size
         )
@@ -176,21 +129,3 @@ class DecoderOnlyTransformer(nn.Module):
             else:
                 hidden = block(hidden)
         return self.lm_head(self.final_norm(hidden))
-
-
-def count_parameters(model: DecoderOnlyTransformer) -> dict[str, int]:
-    total = sum(parameter.numel() for parameter in model.parameters())
-    embedding_ids = {
-        id(model.token_embedding.weight),
-        id(model.position_embedding.weight),
-    }
-    embedding = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if id(parameter) in embedding_ids
-    )
-    return {
-        "total": total,
-        "embedding": embedding,
-        "non_embedding": total - embedding,
-    }

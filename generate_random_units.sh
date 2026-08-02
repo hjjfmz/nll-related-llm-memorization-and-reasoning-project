@@ -24,7 +24,7 @@ echo "  test_units=${TEST_UNITS}"
 echo "  base_seed=${BASE_SEED}"
 echo "  output_dir=${OUTPUT_DIR}"
 
-"${PYTHON_BIN}" generate_phase_c_data.py random-units \
+"${PYTHON_BIN}" -m phase_c.data.cli random-units \
   --V "${V}" \
   --S "${S}" \
   --q "${Q}" \

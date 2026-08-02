@@ -8,7 +8,7 @@ from pathlib import Path
 
 class RandomGenerationTests(unittest.TestCase):
     def test_random_record_has_unique_key_and_answer_only_span(self):
-        from phase_c_data import RandomConfig, generate_random_record
+        from phase_c.data.core import RandomConfig, generate_random_record
 
         config = RandomConfig(V=1024, S=384, q=4, key_seed=17)
         train = generate_random_record(config, "train", sample_id=9, seed=101)
@@ -24,7 +24,7 @@ class RandomGenerationTests(unittest.TestCase):
         self.assertEqual(train["metadata"]["H_R_bits"], 3840.0)
 
     def test_random_generation_is_deterministic(self):
-        from phase_c_data import RandomConfig, generate_random_record
+        from phase_c.data.core import RandomConfig, generate_random_record
 
         config = RandomConfig(V=64, S=12, q=4, key_seed=5)
         first = generate_random_record(config, "test", 123, 999)
@@ -34,7 +34,7 @@ class RandomGenerationTests(unittest.TestCase):
 
 class DagGenerationTests(unittest.TestCase):
     def test_dag_satisfies_layer_path_and_outdegree_invariants(self):
-        from phase_c_data import (
+        from phase_c.data.core import (
             DagConfig,
             count_paths,
             generate_dag_record,
@@ -66,7 +66,7 @@ class DagGenerationTests(unittest.TestCase):
         self.assertEqual(validate_record(record), [])
 
     def test_edge_reordering_keeps_the_same_answer(self):
-        from phase_c_data import (
+        from phase_c.data.core import (
             DagConfig,
             generate_dag_record,
             parse_dag_sequence,
@@ -93,7 +93,7 @@ class DagGenerationTests(unittest.TestCase):
 
 class AdmissionTests(unittest.TestCase):
     def test_streaming_admission_passes_valid_records(self):
-        from phase_c_data import (
+        from phase_c.data.core import (
             DagConfig,
             RandomConfig,
             generate_dag_record,
@@ -127,7 +127,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(report["duplicate_identity_count"], 0)
 
     def test_streaming_admission_detects_duplicate_record(self):
-        from phase_c_data import (
+        from phase_c.data.core import (
             RandomConfig,
             generate_random_record,
             run_admission_checks,
@@ -143,7 +143,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(report["duplicate_identity_count"], 1)
 
     def test_gzip_shards_round_trip_without_loading_all_records(self):
-        from phase_c_data import (
+        from phase_c.data.core import (
             RandomConfig,
             generate_records,
             read_jsonl_gzip,
@@ -173,7 +173,7 @@ class AdmissionTests(unittest.TestCase):
 
 class RandomUnitDatasetTests(unittest.TestCase):
     def test_random_unit_paths_select_prefix_units(self):
-        from phase_c_data import random_unit_paths
+        from phase_c.data.core import random_unit_paths
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -190,7 +190,7 @@ class RandomUnitDatasetTests(unittest.TestCase):
         )
 
     def test_random_unit_paths_reject_missing_unit(self):
-        from phase_c_data import random_unit_paths
+        from phase_c.data.core import random_unit_paths
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -206,7 +206,8 @@ class CliTests(unittest.TestCase):
     def test_preview_cli_prints_parseable_dag_record(self):
         command = [
             sys.executable,
-            "generate_phase_c_data.py",
+            "-m",
+                "phase_c.data.cli",
             "preview",
             "--family",
             "dag",
@@ -225,7 +226,7 @@ class CliTests(unittest.TestCase):
         ]
         result = subprocess.run(
             command,
-            cwd=Path(__file__).resolve().parent,
+            cwd=Path(__file__).resolve().parents[2],
             text=True,
             encoding="utf-8",
             capture_output=True,
@@ -241,7 +242,8 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             command = [
                 sys.executable,
-                "generate_phase_c_data.py",
+                "-m",
+                "phase_c.data.cli",
                 "random-units",
                 "--V",
                 "32",
@@ -262,7 +264,7 @@ class CliTests(unittest.TestCase):
             ]
             result = subprocess.run(
                 command,
-                cwd=Path(__file__).resolve().parent,
+                cwd=Path(__file__).resolve().parents[2],
                 text=True,
                 encoding="utf-8",
                 capture_output=True,

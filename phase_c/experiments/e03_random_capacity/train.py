@@ -14,9 +14,9 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from phase_c_data import RandomConfig, special_tokens, total_vocab_size
-from phase_c_model import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
-from phase_c_training import (
+from phase_c.data.core import RandomConfig, special_tokens, total_vocab_size
+from phase_c.models import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
+from phase_c.training import (
     AnswerOnlyCollator,
     FileRandomRecordDataset,
     RandomRecordDataset,
@@ -101,6 +101,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--run-mode",
+        choices=("train", "resume", "extend", "eval"),
+        default="train",
+        help="Internal execution mode used by the package CLI.",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Load a checkpoint and write final metrics without training steps.",
+    )
+    parser.add_argument(
+        "--extend-lr-policy",
+        choices=("constant-min",),
+        default=None,
+        help="Learning-rate policy for explicit extension runs.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -212,6 +229,10 @@ def _ddp_reduce_scalar(
     return float(tensor.item())
 
 
+def _get_arg(args: argparse.Namespace, name: str, default: object) -> object:
+    return getattr(args, name, default)
+
+
 def _build_run_config(args: argparse.Namespace, context: DistributedContext, max_steps: int) -> dict:
     return {
         key: str(value) if isinstance(value, Path) else value
@@ -290,14 +311,22 @@ def run(args: argparse.Namespace) -> dict | None:
         per_rank_effective_batch = args.micro_batch_size * args.gradient_accumulation
         global_effective_batch = per_rank_effective_batch * context.world_size
         steps_per_epoch = math.ceil(len(train_dataset) / global_effective_batch)
-        max_steps = args.max_steps or args.epochs * steps_per_epoch
+        max_steps = args.max_steps if args.max_steps is not None else args.epochs * steps_per_epoch
         minimum_ratio = args.minimum_learning_rate / args.learning_rate
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lambda step: _lr_factor(
-                step, max_steps, args.warmup_steps, minimum_ratio
-            ),
-        )
+        run_mode = str(_get_arg(args, "run_mode", "train"))
+        eval_only = bool(_get_arg(args, "eval_only", False))
+        extend_lr_policy = _get_arg(args, "extend_lr_policy", None)
+        if run_mode == "extend" and extend_lr_policy == "constant-min":
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+            restore_scheduler = False
+        else:
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lambda step: _lr_factor(
+                    step, max(max_steps, 1), args.warmup_steps, minimum_ratio
+                ),
+            )
+            restore_scheduler = True
         scaler = torch.amp.GradScaler(
             "cuda", enabled=device.type == "cuda" and dtype == torch.float16
         )
@@ -330,6 +359,8 @@ def run(args: argparse.Namespace) -> dict | None:
             )
 
         completed_steps = 0
+        if eval_only and args.resume is None:
+            raise ValueError("eval-only requires --resume")
         if args.resume:
             state = load_checkpoint(
                 args.resume,
@@ -337,9 +368,15 @@ def run(args: argparse.Namespace) -> dict | None:
                 optimizer,
                 stream,
                 device,
-                scheduler,
+                scheduler if restore_scheduler and not eval_only else None,
             )
             completed_steps = state["step"]
+            if run_mode == "extend" and extend_lr_policy == "constant-min":
+                for group in optimizer.param_groups:
+                    group["lr"] = args.learning_rate
+                    group["initial_lr"] = args.learning_rate
+        if eval_only:
+            max_steps = completed_steps
         if context.enabled:
             dist.barrier()
 
