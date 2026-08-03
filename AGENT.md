@@ -15,7 +15,7 @@
 - `phase_c/models/`：decoder-only Transformer、模型规模 preset 与参数统计。
 - `phase_c/training/`：answer-only collation、容量指标、流式样本、checkpoint 保存和恢复。
 - `phase_c/experiments/e03_random_capacity/`：实验 3，随机序列容量标定（含 `train.py` 训练入口、`config.py`、`commands.py`、`reporting.py`）。除非用户明确批准，不要自动执行训练。
-- `phase_c/experiments/e04_dag_reasoning/`：实验 4，纯 DAG 推理极限测量（骨架占位，待实现）。
+- `phase_c/experiments/e04_dag_reasoning/`：实验 4，纯 DAG 推理极限测量（`train.py` 训练入口含 test 监控钩子、`config.py`、`commands.py`）。CLI：`python -m phase_c.cli dag <train/resume/extend/eval/gen-data/inspect>`。除非用户明确批准，不要自动执行训练。
 - `phase_c/experiments/e05_unified_analysis/`：实验 5，统一账本分析（骨架占位，待实现）。
 - `phase_c/tests/`：当前轻量回归测试与结构测试。
 - `phase_c_outputs/`：已生成或验证过的输出。新增结果必须清楚标注阶段和配置。

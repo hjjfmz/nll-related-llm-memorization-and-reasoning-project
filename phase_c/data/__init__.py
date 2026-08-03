@@ -12,6 +12,7 @@ from phase_c.data.core import (
     special_tokens,
     total_vocab_size,
 )
+from phase_c.data.dag_units import write_dag_units
 from phase_c.data.random_units import write_random_units
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "read_jsonl_gzip",
     "config_to_dict",
     "write_random_units",
+    "write_dag_units",
 ]

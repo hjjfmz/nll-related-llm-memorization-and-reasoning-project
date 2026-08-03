@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 from phase_c.experiments.e03_random_capacity.commands import run_random_command
+from phase_c.experiments.e04_dag_reasoning.commands import run_dag_command
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,6 +18,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     random_parser.add_argument("command")
     random_parser.add_argument("args", nargs=argparse.REMAINDER)
+    dag_parser = subparsers.add_parser(
+        "dag", help="DAG path-reasoning depth-limit experiments."
+    )
+    dag_parser.add_argument("command")
+    dag_parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -25,6 +31,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(argv)
     if parsed.family == "random":
         result = run_random_command(parsed.command, parsed.args)
+        if result is not None:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if parsed.family == "dag":
+        result = run_dag_command(parsed.command, parsed.args)
         if result is not None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

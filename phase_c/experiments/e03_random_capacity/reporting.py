@@ -9,9 +9,9 @@ from typing import Iterable
 
 
 DEFAULT_RUNS = (
-    ("5k", Path("phase_c_runs/random_120m_N5k_ddp")),
-    ("10k", Path("phase_c_runs/random_120m_N10k_ddp")),
-    ("100k", Path("phase_c_runs/random_120m_N100k_ddp")),
+    ("5k", Path("phase_c_runs/random_L4_H128_N5k")),
+    ("10k", Path("phase_c_runs/random_L4_H128_N10k")),
+    ("100k", Path("phase_c_runs/random_L4_H128_N100k")),
 )
 
 
@@ -20,21 +20,21 @@ class RunSummary:
     label: str
     path: Path
     train_size: int
-    validation_size: int | None
+    test_size: int | None
     completed_steps: int
     train_nll_bits_per_token: float
-    validation_nll_bits_per_token: float
+    test_nll_bits_per_token: float
     memory_bits: float
     bits_per_parameter: float
     entropy_ceiling_bits_per_parameter: float
-    non_embedding_parameters: int
+    total_parameters: int
     random_baseline_bits_per_token: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot Phase C random-capacity summaries for the 120M model from "
+            "Plot Phase C random-capacity summaries from "
             "final_metrics.json and train_log.jsonl."
         )
     )
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         metavar="LABEL=PATH",
         help=(
             "Run directory to include. May be repeated. Defaults to the three "
-            "current 120M runs: 5k, 10k, and 100k."
+            "current L4_H128 runs: 5k, 10k, and 100k."
         ),
     )
     parser.add_argument(
@@ -56,12 +56,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--summary-name",
-        default="random_120m_capacity_summary.png",
+        default="random_capacity_summary.png",
         help="Filename for the final-metric summary figure.",
     )
     parser.add_argument(
         "--curves-name",
-        default="random_120m_training_curves.png",
+        default="random_capacity_training_curves.png",
         help="Filename for the training-loss curve figure.",
     )
     parser.add_argument(
@@ -135,14 +135,14 @@ def load_run(label: str, path: Path) -> RunSummary:
     arguments = run_arguments(run_config)
 
     train = final_metrics["train"]
-    validation = final_metrics["validation"]
+    test = final_metrics["test"]
     parameters = final_metrics["parameters"]
 
-    train_size = int(arguments.get("train_size", train["samples"]))
-    validation_size = int_or_none(arguments.get("validation_size"))
-    non_embedding_parameters = int(parameters["non_embedding"])
+    train_size = int(train["samples"])
+    test_size = int(test["samples"])
+    total_parameters = int(parameters["total"])
     dataset_entropy_bits = float(train["dataset_entropy_bits"])
-    entropy_ceiling = dataset_entropy_bits / non_embedding_parameters
+    entropy_ceiling = dataset_entropy_bits / total_parameters
 
     V = int(arguments.get("V", 1024))
     random_baseline = math.log2(V)
@@ -151,14 +151,14 @@ def load_run(label: str, path: Path) -> RunSummary:
         label=label,
         path=path,
         train_size=train_size,
-        validation_size=validation_size,
+        test_size=test_size,
         completed_steps=int(final_metrics["completed_steps"]),
         train_nll_bits_per_token=float(train["nll_bits_per_token"]),
-        validation_nll_bits_per_token=float(validation["nll_bits_per_token"]),
+        test_nll_bits_per_token=float(test["nll_bits_per_token"]),
         memory_bits=float(train["memory_bits"]),
         bits_per_parameter=float(train["bits_per_parameter"]),
         entropy_ceiling_bits_per_parameter=entropy_ceiling,
-        non_embedding_parameters=non_embedding_parameters,
+        total_parameters=total_parameters,
         random_baseline_bits_per_token=random_baseline,
     )
 
@@ -205,7 +205,7 @@ def draw_summary(summaries: list[RunSummary], output_path: Path) -> None:
     labels = [summary.label for summary in summaries]
     train_sizes = [summary.train_size for summary in summaries]
     train_nll = [summary.train_nll_bits_per_token for summary in summaries]
-    validation_nll = [summary.validation_nll_bits_per_token for summary in summaries]
+    test_nll = [summary.test_nll_bits_per_token for summary in summaries]
     memory_mbits = [summary.memory_bits / 1_000_000.0 for summary in summaries]
     bits_per_parameter = [summary.bits_per_parameter for summary in summaries]
     entropy_ceiling = [
@@ -214,10 +214,10 @@ def draw_summary(summaries: list[RunSummary], output_path: Path) -> None:
     baseline = summaries[0].random_baseline_bits_per_token
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), constrained_layout=True)
-    fig.suptitle("120M Random-Sequence Memorization Capacity", fontsize=14)
+    fig.suptitle("Random-Sequence Memorization Capacity", fontsize=14)
 
     axes[0].plot(train_sizes, train_nll, marker="o", label="train")
-    axes[0].plot(train_sizes, validation_nll, marker="s", label="validation")
+    axes[0].plot(train_sizes, test_nll, marker="s", label="test")
     axes[0].axhline(
         baseline,
         color="0.45",
@@ -292,7 +292,7 @@ def draw_curves(run_specs: list[tuple[str, Path]], output_path: Path) -> bool:
             linewidth=1.7,
         )
 
-    axis.set_title("120M Training Loss Curves")
+    axis.set_title("Random-Sequence Training Loss Curves")
     axis.set_xlabel("optimizer step")
     axis.set_ylabel("train loss, bits / token")
     axis.grid(True, alpha=0.25)
@@ -310,14 +310,14 @@ def write_table(summaries: list[RunSummary], output_path: Path) -> None:
         "label",
         "path",
         "train_size",
-        "validation_size",
+        "test_size",
         "completed_steps",
         "train_nll_bits_per_token",
         "validation_nll_bits_per_token",
         "memory_bits",
         "bits_per_parameter",
         "entropy_ceiling_bits_per_parameter",
-        "non_embedding_parameters",
+        "total_parameters",
     ]
     lines = [",".join(header)]
     for summary in summaries:
@@ -325,14 +325,14 @@ def write_table(summaries: list[RunSummary], output_path: Path) -> None:
             summary.label,
             str(summary.path),
             str(summary.train_size),
-            "" if summary.validation_size is None else str(summary.validation_size),
+            "" if summary.test_size is None else str(summary.test_size),
             str(summary.completed_steps),
             f"{summary.train_nll_bits_per_token:.10g}",
             f"{summary.validation_nll_bits_per_token:.10g}",
             f"{summary.memory_bits:.10g}",
             f"{summary.bits_per_parameter:.10g}",
             f"{summary.entropy_ceiling_bits_per_parameter:.10g}",
-            str(summary.non_embedding_parameters),
+            str(summary.total_parameters),
         ]
         lines.append(",".join(row))
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,7 +350,7 @@ def main() -> int:
     print(f"wrote {summary_path}")
 
     if args.write_csv:
-        table_path = args.output_dir / "random_120m_capacity_summary.csv"
+        table_path = args.output_dir / "random_capacity_summary.csv"
         write_table(summaries, table_path)
         print(f"wrote {table_path}")
 

@@ -9,6 +9,7 @@ __pycache__/
 phase_c_outputs/
 phase_c_runs/
 phase_c_random_data/
+phase_c_dag_data/
 
 # Documentation and image assets not intended for GitHub
 /docs/

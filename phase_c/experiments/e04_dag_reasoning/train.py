@@ -6,54 +6,58 @@ import math
 import os
 import random
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
 
-from phase_c.data.core import RandomConfig, special_tokens, total_vocab_size
+from phase_c.data.core import DagConfig, special_tokens, total_vocab_size
 from phase_c.models import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
 from phase_c.training import (
     AnswerOnlyCollator,
-    FileRandomRecordDataset,
-    RandomRecordDataset,
+    DagRecordDataset,
+    FileDagRecordDataset,
     SampleStream,
     causal_lm_loss,
-    evaluate_random_model,
+    evaluate_dag_model,
     load_checkpoint,
     save_checkpoint,
 )
-
-
-@dataclass(frozen=True)
-class DistributedContext:
-    enabled: bool
-    rank: int
-    world_size: int
-    local_rank: int
-
-    @property
-    def is_main_process(self) -> bool:
-        return self.rank == 0
+from phase_c.training.common import (
+    append_jsonl,
+    atomic_write_json,
+    build_run_config,
+    ddp_reduce_scalar,
+    destroy_distributed,
+    distributed_context,
+    get_arg,
+    initialize_distributed,
+    lr_factor,
+    resolve_device,
+    resolve_dtype,
+    unwrap_model,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="From-scratch random-sequence capacity pretraining."
+        description="From-scratch DAG path-reasoning depth-limit measurement (E4)."
     )
     parser.add_argument("--model", choices=tuple(MODEL_PRESETS), default="L4_H128")
     parser.add_argument("--V", type=int, default=2048)
-    parser.add_argument("--S", type=int, default=64)
+    parser.add_argument(
+        "--L", type=int, default=4, help="DAG path depth (number of answer tokens)"
+    )
+    parser.add_argument("--d", type=int, default=2, help="per-node out-degree / branch factor")
+    parser.add_argument("--W", type=int, default=None, help="layer width; defaults to d+2")
     parser.add_argument("--train-size", type=int, default=100_000)
-    parser.add_argument("--validation-size", type=int, default=10_000)
+    parser.add_argument("--test-size", type=int, default=20_000)
     parser.add_argument(
         "--dataset-root",
         type=Path,
         default=None,
-        help="Read fixed random units from this root instead of online generation.",
+        help="Read fixed DAG units from this root instead of online generation.",
     )
     parser.add_argument(
         "--train-units",
@@ -68,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of 1k test unit files to read from dataset-root/test.",
     )
     parser.add_argument("--train-seed", type=int, default=20270616)
-    parser.add_argument("--validation-seed", type=int, default=20270617)
+    parser.add_argument("--test-seed", type=int, default=20270617)
     parser.add_argument("--sampling-seed", type=int, default=20270618)
     parser.add_argument("--model-seed", type=int, default=20270619)
     parser.add_argument("--micro-batch-size", type=int, default=8)
@@ -88,9 +92,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-size",
         type=int,
         default=10_000,
-        help="0 evaluates the complete split and is required for formal capacity.",
+        help="0 evaluates the complete split and is required for formal metrics.",
     )
     parser.add_argument("--eval-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=1_000,
+        help="run a test monitor eval every this many steps (grokking signal); 0 disables",
+    )
+    parser.add_argument(
+        "--monitor-eval-size",
+        type=int,
+        default=2_000,
+        help="number of test samples per periodic monitor eval",
+    )
+    parser.add_argument(
+        "--edge-reorder-seed",
+        type=int,
+        default=None,
+        help="if set, also evaluate test with edge-reordered inputs (order-invariance control)",
+    )
     parser.add_argument(
         "--dtype",
         choices=("float32", "bfloat16", "float16"),
@@ -119,159 +141,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("phase_c_runs/random_L4_H128_units"),
+        default=Path("phase_c_runs/dag_L4_H128_depth4_d2"),
     )
     return parser
 
 
-def _atomic_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), "utf-8")
-    os.replace(temporary, path)
-
-
-def _append_jsonl(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
-
-
-def _distributed_context() -> DistributedContext:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    return DistributedContext(
-        enabled=world_size > 1,
-        rank=rank,
-        world_size=world_size,
-        local_rank=local_rank,
-    )
-
-
-def _initialize_distributed(context: DistributedContext, device: torch.device) -> None:
-    if not context.enabled:
-        return
-    if device.type != "cuda":
-        raise ValueError("DDP currently requires CUDA for this training script")
-    if dist.is_initialized():
-        return
-    torch.cuda.set_device(context.local_rank)
-    backend = "gloo" if os.name == "nt" else "nccl"
-    dist.init_process_group(backend=backend)
-
-
-def _destroy_distributed(context: DistributedContext) -> None:
-    if context.enabled and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _resolve_device(requested: str, context: DistributedContext) -> torch.device:
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda", context.local_rank if context.enabled else 0)
-        return torch.device("cpu")
-    if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise ValueError("CUDA requested but unavailable")
-        return torch.device("cuda", context.local_rank if context.enabled else 0)
-    if context.enabled:
-        raise ValueError("distributed training requires CUDA devices")
-    return torch.device(requested)
-
-
-def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
-    dtype = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }[name]
-    if device.type == "cpu":
-        return torch.float32
-    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-        raise ValueError("GPU does not support bfloat16")
-    return dtype
-
-
-def _lr_factor(
-    step: int, max_steps: int, warmup_steps: int, minimum_ratio: float
-) -> float:
-    if warmup_steps and step < warmup_steps:
-        return max((step + 1) / warmup_steps, 1e-8)
-    if max_steps <= warmup_steps:
-        return 1.0
-    progress = min(
-        max((step - warmup_steps) / (max_steps - warmup_steps), 0.0), 1.0
-    )
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return minimum_ratio + (1.0 - minimum_ratio) * cosine
-
-
-def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return model.module if isinstance(model, DistributedDataParallel) else model
-
-
-def _ddp_reduce_scalar(
-    value: float,
-    device: torch.device,
-    context: DistributedContext,
-    reduction: str,
-) -> float:
-    if not context.enabled:
-        return value
-    tensor = torch.tensor([value], device=device, dtype=torch.float64)
-    op = dist.ReduceOp.SUM if reduction == "mean" else dist.ReduceOp.MAX
-    dist.all_reduce(tensor, op=op)
-    if reduction == "mean":
-        tensor /= context.world_size
-    return float(tensor.item())
-
-
-def _get_arg(args: argparse.Namespace, name: str, default: object) -> object:
-    return getattr(args, name, default)
-
-
-def _build_run_config(args: argparse.Namespace, context: DistributedContext, max_steps: int) -> dict:
-    return {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
-    } | {
-        "resolved_max_steps": max_steps,
-        "distributed": {
-            "enabled": context.enabled,
-            "world_size": context.world_size,
-        },
-    }
+def _dag_config(args: argparse.Namespace) -> DagConfig:
+    width = args.W if args.W is not None else args.d + 2
+    return DagConfig(V=args.V, L=args.L, d=args.d, W=width)
 
 
 def _build_datasets(
     args: argparse.Namespace,
-) -> tuple[RandomRecordDataset | FileRandomRecordDataset, RandomRecordDataset | FileRandomRecordDataset, RandomConfig]:
+) -> tuple[DagRecordDataset | FileDagRecordDataset, DagRecordDataset | FileDagRecordDataset, DagConfig]:
     if args.dataset_root is None:
-        data_config = RandomConfig(args.V, args.S)
-        train_dataset = RandomRecordDataset(
+        data_config = _dag_config(args)
+        train_dataset = DagRecordDataset(
             data_config, "train", args.train_size, args.train_seed
         )
-        test_dataset = RandomRecordDataset(
-            data_config, "test", args.validation_size, args.validation_seed
+        test_dataset = DagRecordDataset(
+            data_config, "test", args.test_size, args.test_seed
         )
         return train_dataset, test_dataset, data_config
 
     if args.train_units is None or args.test_units is None:
         raise ValueError("dataset-root requires both --train-units and --test-units")
-    train_dataset = FileRandomRecordDataset(args.dataset_root, "train", args.train_units)
-    test_dataset = FileRandomRecordDataset(args.dataset_root, "test", args.test_units)
+    train_dataset = FileDagRecordDataset(args.dataset_root, "train", args.train_units)
+    test_dataset = FileDagRecordDataset(args.dataset_root, "test", args.test_units)
     if train_dataset.config != test_dataset.config:
         raise ValueError("train and test file-backed datasets have different configs")
     return train_dataset, test_dataset, train_dataset.config
 
 
 def run(args: argparse.Namespace) -> dict | None:
-    context = _distributed_context()
-    device = _resolve_device(args.device, context)
-    _initialize_distributed(context, device)
+    context = distributed_context()
+    device = resolve_device(args.device, context)
+    initialize_distributed(context, device)
     try:
-        dtype = _resolve_dtype(args.dtype, device)
+        dtype = resolve_dtype(args.dtype, device)
 
         # Keep model initialization identical across ranks.
         torch.manual_seed(args.model_seed)
@@ -285,9 +192,12 @@ def run(args: argparse.Namespace) -> dict | None:
 
         train_dataset, test_dataset, data_config = _build_datasets(args)
         model_config = MODEL_PRESETS[args.model]
-        sequence_length = data_config.S + 2
+        sequence_length = data_config.sequence_length
         if sequence_length > model_config.context_length:
-            raise ValueError("data sequence exceeds model context length")
+            raise ValueError(
+                f"DAG sequence length {sequence_length} exceeds model context "
+                f"{model_config.context_length}"
+            )
 
         collator = AnswerOnlyCollator(special_tokens(data_config.V)["PAD"])
         stream = SampleStream(len(train_dataset), args.sampling_seed)
@@ -317,16 +227,16 @@ def run(args: argparse.Namespace) -> dict | None:
             else args.epochs * steps_per_epoch
         )
         minimum_ratio = args.minimum_learning_rate / args.learning_rate
-        run_mode = str(_get_arg(args, "run_mode", "train"))
-        eval_only = bool(_get_arg(args, "eval_only", False))
-        extend_lr_policy = _get_arg(args, "extend_lr_policy", None)
+        run_mode = str(get_arg(args, "run_mode", "train"))
+        eval_only = bool(get_arg(args, "eval_only", False))
+        extend_lr_policy = get_arg(args, "extend_lr_policy", None)
         if run_mode == "extend" and extend_lr_policy == "constant-min":
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
             restore_scheduler = False
         else:
             scheduler = torch.optim.lr_scheduler.LambdaLR(
                 optimizer,
-                lambda step: _lr_factor(
+                lambda step: lr_factor(
                     step, max(max_steps, 1), args.warmup_steps, minimum_ratio
                 ),
             )
@@ -334,10 +244,10 @@ def run(args: argparse.Namespace) -> dict | None:
         scaler = torch.amp.GradScaler(
             "cuda", enabled=device.type == "cuda" and dtype == torch.float16
         )
-        run_config = _build_run_config(args, context, max_steps)
+        run_config = build_run_config(args, context, max_steps)
 
         if context.enabled:
-            model = DistributedDataParallel(
+            model = torch.nn.parallel.DistributedDataParallel(
                 base_model,
                 device_ids=[context.local_rank],
                 output_device=context.local_rank,
@@ -347,13 +257,14 @@ def run(args: argparse.Namespace) -> dict | None:
 
         if context.is_main_process:
             args.output_dir.mkdir(parents=True, exist_ok=True)
-            _atomic_json(
+            atomic_write_json(
                 args.output_dir / "run_config.json",
                 {
                     "arguments": run_config,
                     "model": model_config.to_dict(),
                     "parameters": parameter_counts,
-                    "H_R_bits_per_sample": data_config.H_R_bits,
+                    "H_R_bits_per_sample": data_config.L * math.log2(data_config.V),
+                    "H_L_bits_per_sample": data_config.H_L_bits,
                     "sequence_length": sequence_length,
                     "per_rank_effective_batch_size": per_rank_effective_batch,
                     "global_effective_batch_size": global_effective_batch,
@@ -368,7 +279,7 @@ def run(args: argparse.Namespace) -> dict | None:
         if args.resume:
             state = load_checkpoint(
                 args.resume,
-                _unwrap_model(model),
+                unwrap_model(model),
                 optimizer,
                 stream,
                 device,
@@ -427,14 +338,14 @@ def run(args: argparse.Namespace) -> dict | None:
                 log = {
                     "step": step,
                     "epoch": stream.epoch + stream.position / stream.size,
-                    "loss_nats_per_token": _ddp_reduce_scalar(
+                    "loss_nats_per_token": ddp_reduce_scalar(
                         accumulated_loss / args.gradient_accumulation,
                         device,
                         context,
                         reduction="mean",
                     ),
                     "learning_rate": scheduler.get_last_lr()[0],
-                    "gradient_norm": _ddp_reduce_scalar(
+                    "gradient_norm": ddp_reduce_scalar(
                         float(gradient_norm),
                         device,
                         context,
@@ -444,15 +355,41 @@ def run(args: argparse.Namespace) -> dict | None:
                 }
                 if device.type == "cuda":
                     peak_memory_gb = torch.cuda.max_memory_allocated(device) / 2**30
-                    log["cuda_peak_allocated_gb"] = _ddp_reduce_scalar(
+                    log["cuda_peak_allocated_gb"] = ddp_reduce_scalar(
                         peak_memory_gb,
                         device,
                         context,
                         reduction="max",
                     )
                 if context.is_main_process:
-                    _append_jsonl(args.output_dir / "train_log.jsonl", log)
+                    append_jsonl(args.output_dir / "train_log.jsonl", log)
                     print(json.dumps(log, ensure_ascii=False), flush=True)
+
+            if (
+                context.is_main_process
+                and args.eval_interval
+                and step % args.eval_interval == 0
+            ):
+                monitor = evaluate_dag_model(
+                    unwrap_model(model),
+                    test_dataset,
+                    collator,
+                    args.eval_batch_size,
+                    device,
+                    dtype,
+                    args.monitor_eval_size,
+                )
+                eval_entry = {
+                    "step": step,
+                    "epoch": stream.epoch + stream.position / stream.size,
+                    "nll_bits_per_token": monitor["nll_bits_per_token"],
+                    "lambda": monitor["lambda"],
+                    "em": monitor["em"],
+                    "path_validity_rate": monitor["path_validity_rate"],
+                    "elapsed_seconds": time.perf_counter() - started,
+                }
+                append_jsonl(args.output_dir / "eval_log.jsonl", eval_entry)
+                print("EVAL " + json.dumps(eval_entry, ensure_ascii=False), flush=True)
 
             if step % args.checkpoint_interval == 0 or step == max_steps:
                 if context.enabled:
@@ -460,7 +397,7 @@ def run(args: argparse.Namespace) -> dict | None:
                 if context.is_main_process:
                     save_checkpoint(
                         args.output_dir / "checkpoint_latest.pt",
-                        _unwrap_model(model),
+                        unwrap_model(model),
                         optimizer,
                         step,
                         stream,
@@ -473,24 +410,22 @@ def run(args: argparse.Namespace) -> dict | None:
         if not context.is_main_process:
             return None
 
-        train_metrics = evaluate_random_model(
-            _unwrap_model(model),
+        train_metrics = evaluate_dag_model(
+            unwrap_model(model),
             train_dataset,
             collator,
             args.eval_batch_size,
             device,
             dtype,
-            parameter_counts,
             args.eval_size,
         )
-        test_metrics = evaluate_random_model(
-            _unwrap_model(model),
+        test_metrics = evaluate_dag_model(
+            unwrap_model(model),
             test_dataset,
             collator,
             args.eval_batch_size,
             device,
             dtype,
-            parameter_counts,
             args.eval_size,
         )
         metrics = {
@@ -498,13 +433,32 @@ def run(args: argparse.Namespace) -> dict | None:
             "train": train_metrics,
             "test": test_metrics,
             "parameters": parameter_counts,
-            "formal_capacity_evaluation": train_metrics["samples"]
-            == len(train_dataset),
+            "config": {
+                "V": data_config.V,
+                "L": data_config.L,
+                "d": data_config.d,
+                "W": data_config.W,
+                "H_L_bits": data_config.H_L_bits,
+                "H_R_bits": data_config.L * math.log2(data_config.V),
+                "sequence_length": sequence_length,
+            },
+            "formal_capacity_evaluation": train_metrics["samples"] == len(train_dataset),
         }
-        _atomic_json(args.output_dir / "final_metrics.json", metrics)
+        if args.edge_reorder_seed is not None:
+            metrics["test_edge_reordered"] = evaluate_dag_model(
+                unwrap_model(model),
+                test_dataset,
+                collator,
+                args.eval_batch_size,
+                device,
+                dtype,
+                args.eval_size,
+                reorder_edges_seed=args.edge_reorder_seed,
+            )
+        atomic_write_json(args.output_dir / "final_metrics.json", metrics)
         return metrics
     finally:
-        _destroy_distributed(context)
+        destroy_distributed(context)
 
 
 def main() -> int:

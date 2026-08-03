@@ -1,6 +1,6 @@
 # 随机序列记忆容量实验说明
 
-本仓库当前聚焦 Phase C 的第一步：**纯随机序列记忆容量标定**。目标不是先做 DAG 推理实验，而是先复现 Morris 等人在《How much do language models memorize?》中的核心测量范式：对同一参数规模的 from-scratch GPT-style 模型，扫描多个训练集规模 `N`，观察模型从欠拟合到记忆饱和的曲线，并估计容量密度 `alpha`，再与论文中的约 `3.6 bits/parameter` 对齐。
+当前默认协议与论文的随机容量设置对齐：每条样本是 `[BOS] y_1 ... y_64 [EOS]`，其中每个 `y_i` 独立均匀采样自 `V=2048` 个 token；全部 64 个随机 token 均接受因果 LM 监督。默认训练使用 Adam、bf16、无 weight decay、固定 `1,000,000` optimizer steps；双卡下 `micro-batch-size=8`、`gradient-accumulation=128` 对应全局 batch 2048。`bits_per_parameter` 使用总可训练参数量作分母，另保留 non-embedding 口径供诊断。
 
 ---
 
@@ -50,28 +50,33 @@
 
 | 文件/目录 | 作用 |
 |---|---|
-| `phase_c/cli.py` | 新主入口，提供 `random train/resume/extend/eval/gen-data/inspect` 子命令 |
+| `phase_c/cli.py` | 新主入口，提供 `random` / `dag` 两个 family（各自 `train/resume/extend/eval/gen-data/inspect` 子命令） |
 | `phase_c/experiments/e03_random_capacity/config.py` | 实验 3 随机容量：运行配置加载、`resume/extend/eval` 参数构造与防呆 |
 | `phase_c/experiments/e03_random_capacity/commands.py` | 实验 3 随机容量：子命令分发 |
 | `phase_c/experiments/e03_random_capacity/train.py` | 实验 3 随机容量：训练主循环与 DDP 训练入口 |
-| `phase_c/experiments/e04_dag_reasoning/` | 实验 4 纯 DAG 推理极限测量（骨架占位，待实现） |
+| `phase_c/experiments/e04_dag_reasoning/train.py` | 实验 4 DAG：训练主循环，含周期性 test 监控钩子（`eval_log.jsonl` 记录 grokking 信号） |
+| `phase_c/experiments/e04_dag_reasoning/config.py` | 实验 4 DAG：`resume/extend/eval` 参数构造与防呆 |
+| `phase_c/experiments/e04_dag_reasoning/commands.py` | 实验 4 DAG：子命令分发 |
 | `phase_c/experiments/e05_unified_analysis/` | 实验 5 统一账本分析（骨架占位，待实现） |
 | `phase_c/data/core.py` | 随机序列、DAG、admission、JSONL/GZIP 数据核心实现 |
-| `phase_c/data/cli.py` | 数据 preview/validate/write/random-units 命令入口 |
+| `phase_c/data/cli.py` | 数据 preview/validate/write/random-units/dag-units 命令入口 |
 | `phase_c/data/random_units.py` | 固定 1k unit 随机数据集落盘与 manifest 生成 |
+| `phase_c/data/dag_units.py` | 固定 unit DAG 数据集落盘与 manifest 生成 |
 | `phase_c/models/config.py` | `ModelConfig` 定义与参数合法性检查 |
 | `phase_c/models/presets.py` | 论文对齐的小模型 preset 网格 |
 | `phase_c/models/transformer.py` | Decoder-only Transformer、attention、MLP、block 实现 |
 | `phase_c/models/counting.py` | total / embedding / non-embedding 参数量统计 |
 | `phase_c/models/inspect.py` | 查看模型 preset、参数量、non-embedding 参数 |
 | `phase_c/training/collation.py` | answer-only label 构造 |
-| `phase_c/training/datasets.py` | 在线随机数据集与文件 unit 数据集 |
+| `phase_c/training/datasets.py` | 在线/文件 unit 数据集（random 与 DAG 两套） |
 | `phase_c/training/stream.py` | 可恢复、可 DDP 分片的训练样本流 |
 | `phase_c/training/losses.py` | causal LM loss |
-| `phase_c/training/evaluation.py` | NLL、memory_bits、bits_per_parameter 评估 |
+| `phase_c/training/evaluation.py` | 随机容量（NLL/memory）与 DAG 推理（λ/EM/stepwise/path validity/边序对照）评估 |
 | `phase_c/training/checkpoint.py` | checkpoint 保存、加载、RNG 状态兼容恢复 |
+| `phase_c/training/common.py` | 共享训练辅助（DDP/device/LR/IO），供 E4+ 使用 |
 | `phase_c/experiments/e03_random_capacity/reporting.py` | 实验 3 随机容量结果绘图脚本 |
-| `generate_random_units.sh` | Linux/bash 下的一键数据生成脚本 |
+| `generate_random_units.sh` | Linux/bash 下随机数据一键生成脚本 |
+| `generate_dag_units.sh` | Linux/bash 下 DAG 数据一键生成脚本 |
 | `phase_c/tests/test_phase_c_data.py` | 数据生成与 CLI 测试 |
 | `phase_c/tests/test_phase_c_training.py` | 模型、训练、checkpoint、文件数据集测试 |
 | `phase_c/tests/test_phase_c_random_cli.py` | 新主入口、resume/extend/eval 语义测试 |
@@ -87,7 +92,7 @@
 | 实验 1 | 数据与测量管线准入 | `phase_c/data/core.py`（`run_admission_checks`、`validate_record`）+ `phase_c/data/cli.py`（`validate` 命令） |
 | 实验 2 | 训练脚本 CPU smoke | `phase_c/training/` + `python -m phase_c.cli random train --max-steps 1 --device cpu` |
 | 实验 3 | 纯随机序列容量标定（已完成） | `phase_c/experiments/e03_random_capacity/`（`train/config/commands/reporting`） |
-| 实验 4 | 纯 DAG 推理极限测量（待实现） | `phase_c/experiments/e04_dag_reasoning/`（骨架占位） |
+| 实验 4 | 纯 DAG 推理极限测量（代码已就绪，待服务器跑） | `phase_c/experiments/e04_dag_reasoning/`（`train/config/commands`）+ `phase_c/data/dag_units.py` |
 | 实验 5 | 统一账本分析（待实现） | `phase_c/experiments/e05_unified_analysis/`（骨架占位） |
 
 ---
@@ -103,27 +108,26 @@ python -m phase_c.cli random <command> ...
 ### 4.1 查看模型参数量
 
 ```bash
-python -m phase_c.cli random inspect --model L4_H128 --V 1024
+python -m phase_c.cli random inspect --model L4_H128 --V 2048
 ```
 
 重点看：
 
 ```text
-parameters.non_embedding
+parameters.total
 ```
 
 ### 4.2 生成随机 unit 数据
 
 ```bash
 python -m phase_c.cli random gen-data \
-  --V 1024 \
-  --S 32 \
-  --q 4 \
+  --V 2048 \
+  --S 64 \
   --unit-size 1000 \
   --train-units 1000 \
   --test-units 20 \
   --base-seed 20260715 \
-  --output-dir phase_c_random_data/V1024_S32_q4_seed20260715
+  --output-dir phase_c_random_data/V2048_S64_seed20260715
 ```
 
 ### 4.3 新实验
@@ -131,12 +135,12 @@ python -m phase_c.cli random gen-data \
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random train \
   --model L4_H128 \
-  --dataset-root phase_c_random_data/V1024_S32_q4_seed20260715 \
+  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
   --train-units 10 \
   --test-units 5 \
-  --epochs 300 \
+  --max-steps 1000000 \
   --eval-size 0 \
-  --output-dir phase_c_runs/random_L4_H128_units10_e300
+  --output-dir phase_c_runs/random_L4_H128_N10k_steps1m
 ```
 
 ### 4.4 中断后严格恢复
@@ -145,7 +149,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random resume \
-  --run-dir phase_c_runs/random_L4_H128_units10_e300
+  --run-dir phase_c_runs/random_L4_H128_N10k_steps1m
 ```
 
 ### 4.5 没到平台时追加训练
@@ -154,10 +158,10 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random extend \
-  --run-dir phase_c_runs/random_L4_H128_units10_e300 \
-  --extra-epochs 100 \
+  --run-dir phase_c_runs/random_L4_H128_N10k_steps1m \
+  --extra-steps 250000 \
   --lr-policy constant-min \
-  --output-dir phase_c_runs/random_L4_H128_units10_e300_extend001
+  --output-dir phase_c_runs/random_L4_H128_N10k_steps1m_extend001
 ```
 
 ### 4.6 手动停训后补最终评估
@@ -170,6 +174,43 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli
   --eval-size 0 \
   --output-dir phase_c_runs/random_L4_H128_units10_e300_eval
 ```
+
+### 4.7 实验 4：DAG 推理极限测量（E4）
+
+三个命令：生成数据 → 训练（自动监控 grokking）→ 测指标。
+
+生成 DAG 数据（`W` 默认 `d+2`）：
+
+```bash
+python -m phase_c.cli dag gen-data \
+  --V 2048 --L 4 --d 2 \
+  --unit-size 1000 --train-units 100 --test-units 20 \
+  --base-seed 20260715 \
+  --output-dir phase_c_dag_data/V2048_L4_d2_seed20260715
+```
+
+训练（`--eval-interval` 控制监控频率，监控写进 `eval_log.jsonl`，可观察 test NLL 是否跌破随机基线 `H_R=L·log2(V)` 即 grokking）：
+
+```bash
+python -m phase_c.cli dag train \
+  --model L4_H128 \
+  --dataset-root phase_c_dag_data/V2048_L4_d2_seed20260715 \
+  --train-units 100 --test-units 20 \
+  --max-steps 100000 \
+  --eval-interval 1000 --monitor-eval-size 2000 \
+  --output-dir phase_c_runs/dag_L4_H128_depth4_d2
+```
+
+测指标（λ / EM / stepwise / path validity，`--edge-reorder-seed` 输出边序重排对照）：
+
+```bash
+python -m phase_c.cli dag eval \
+  --run-dir phase_c_runs/dag_L4_H128_depth4_d2 \
+  --eval-size 0 --edge-reorder-seed 123 \
+  --output-dir phase_c_runs/dag_L4_H128_depth4_d2_eval
+```
+
+E4 核心指标（`final_metrics.json` 的 `test` 字段）：`lambda=(nll_bits_per_sample−H_L)/L`、`em`、`stepwise_conditional_accuracy`、`path_validity_rate`、`solver_em`（确定性求解器上界，正常应为 1.0）。
 
 ---
 
@@ -207,9 +248,8 @@ MODEL_PRESETS = {
 默认随机序列设置：
 
 ```text
-V = 1024
-S = 32
-q = 4
+V = 2048
+S = 64
 unit_size = 1000
 base_seed = 20260715
 ```
@@ -217,14 +257,14 @@ base_seed = 20260715
 每条样本的信息量为：
 
 ```text
-H_R = S * log2(V) = 32 * 10 = 320 bits
+H_R = S * log2(V) = 64 * 11 = 704 bits
 ```
 
 默认数据目录：
 
 ```text
 phase_c_random_data/
-  V1024_S32_q4_seed20260715/
+  V2048_S64_seed20260715/
     dataset_manifest.json
     train/
       1.jsonl.gz
@@ -278,28 +318,26 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ```powershell
 D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
-  --V 1024 `
-  --S 32 `
-  --q 4 `
+  --V 2048 `
+  --S 64 `
   --unit-size 1000 `
   --train-units 100 `
   --test-units 20 `
   --base-seed 20260715 `
-  --output-dir phase_c_random_data\V1024_S32_q4_seed20260715
+  --output-dir phase_c_random_data\V2048_S64_seed20260715
 ```
 
 ### Windows PowerShell：生成 1M train + 20k test
 
 ```powershell
 D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
-  --V 1024 `
-  --S 32 `
-  --q 4 `
+  --V 2048 `
+  --S 64 `
   --unit-size 1000 `
   --train-units 1000 `
   --test-units 20 `
   --base-seed 20260715 `
-  --output-dir phase_c_random_data\V1024_S32_q4_seed20260715
+  --output-dir phase_c_random_data\V2048_S64_seed20260715
 ```
 
 ### Linux/bash：使用脚本生成
@@ -347,12 +385,11 @@ OK
 D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
   --V 32 `
   --S 6 `
-  --q 4 `
   --unit-size 10 `
   --train-units 2 `
   --test-units 2 `
   --base-seed 1234 `
-  --output-dir phase_c_random_data\smoke_V32_S6_q4_seed1234
+  --output-dir phase_c_random_data\smoke_V32_S6_seed1234
 ```
 
 跑 1 step：
@@ -360,7 +397,7 @@ D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
 ```powershell
 D:\anaconda\envs\minimind\python.exe -m phase_c.cli random train `
   --model debug `
-  --dataset-root phase_c_random_data\smoke_V32_S6_q4_seed1234 `
+  --dataset-root phase_c_random_data\smoke_V32_S6_seed1234 `
   --train-units 2 `
   --test-units 2 `
   --device cpu `
@@ -380,10 +417,10 @@ D:\anaconda\envs\minimind\python.exe -m phase_c.cli random train `
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli random train \
   --model L4_H128 \
-  --dataset-root phase_c_random_data/V1024_S32_q4_seed20260715 \
+  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
   --train-units 100 \
   --test-units 20 \
-  --epochs 20 \
+  --max-steps 1000000 \
   --eval-size 0 \
   --output-dir phase_c_runs/random_L4_H128_units100
 ```
@@ -393,10 +430,10 @@ CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli random train \
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random train \
   --model L4_H128 \
-  --dataset-root phase_c_random_data/V1024_S32_q4_seed20260715 \
+  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
   --train-units 100 \
   --test-units 20 \
-  --epochs 20 \
+  --max-steps 1000000 \
   --eval-size 0 \
   --output-dir phase_c_runs/random_L4_H128_units100
 ```
@@ -406,10 +443,10 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random train \
   --model L4_H128 \
-  --dataset-root phase_c_random_data/V1024_S32_q4_seed20260715 \
+  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
   --train-units 1000 \
   --test-units 20 \
-  --epochs 20 \
+  --max-steps 1000000 \
   --eval-size 0 \
   --output-dir phase_c_runs/random_L4_H128_units1000
 ```
@@ -471,7 +508,7 @@ final_metrics.json
     "samples": 0
   },
   "parameters": {
-    "non_embedding": 0
+    "total": 0
   },
   "formal_capacity_evaluation": true
 }
@@ -500,7 +537,7 @@ final_metrics.json
 - train/test 使用不同 split；
 - 不同 `train_units` 之间是前缀关系；
 - `test` 不与 `train` 共用同一批样本；
-- `V/S/q/base_seed/unit_size` 在 manifest 中可追踪。
+- `V/S/base_seed/unit_size` 在 manifest 中可追踪。
 
 ### 实验合理性验收
 
@@ -520,7 +557,7 @@ final_metrics.json
 1. 对同一个模型 `P`，扫描多个 `N`；
 2. 数据总熵覆盖从欠拟合到接近/超过模型容量的范围；
 3. `memory_bits` 随 `N` 上升后出现平台；
-4. 平台值除以 `non_embedding_parameters` 得到稳定的 `bits_per_parameter`；
+4. 平台值除以总可训练参数量得到稳定的 `bits_per_parameter`；
 5. 多个模型规模的容量平台近似线性随 `P` 增长；
 6. 拟合得到的 `alpha` 与论文 `~3.6 bits/parameter` 在合理误差内。
 
@@ -535,7 +572,7 @@ final_metrics.json
 上限为：
 
 ```text
-max_bits_per_parameter = dataset_entropy_bits / non_embedding_parameters
+max_bits_per_parameter = dataset_entropy_bits / total_parameters
 ```
 
 ### 误区 2：test loss 不下降是坏事

@@ -17,6 +17,7 @@ from phase_c.data.core import (
     run_admission_checks,
     write_jsonl_gzip_shards,
 )
+from phase_c.data.dag_units import write_dag_units
 from phase_c.data.random_units import write_random_units
 
 
@@ -63,10 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
         "random-units",
         help="write fixed-size random train/test unit files",
     )
-    random_units.add_argument("--V", type=int, default=1024)
-    random_units.add_argument("--S", type=int, default=32)
-    random_units.add_argument("--q", type=int, default=4)
-    random_units.add_argument("--key-seed", type=int, default=0)
+    random_units.add_argument("--V", type=int, default=2048)
+    random_units.add_argument("--S", type=int, default=64)
     random_units.add_argument("--unit-size", type=int, default=1_000)
     random_units.add_argument("--train-units", type=int, required=True)
     random_units.add_argument("--test-units", type=int, required=True)
@@ -74,7 +73,30 @@ def build_parser() -> argparse.ArgumentParser:
     random_units.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("phase_c_random_data/V1024_S32_q4_seed20260715"),
+        default=Path("phase_c_random_data/V2048_S64_seed20260715"),
+    )
+
+    dag_units = subparsers.add_parser(
+        "dag-units",
+        help="write fixed-size DAG train/test unit files",
+    )
+    dag_units.add_argument("--V", type=int, default=2048)
+    dag_units.add_argument("--L", type=int, default=4)
+    dag_units.add_argument("--d", type=int, default=2)
+    dag_units.add_argument(
+        "--W",
+        type=int,
+        default=None,
+        help="layer width; defaults to d+2",
+    )
+    dag_units.add_argument("--unit-size", type=int, default=1_000)
+    dag_units.add_argument("--train-units", type=int, required=True)
+    dag_units.add_argument("--test-units", type=int, required=True)
+    dag_units.add_argument("--base-seed", type=int, default=20260715)
+    dag_units.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("phase_c_dag_data/V2048_L4_d2_W6_seed20260715"),
     )
     return parser
 
@@ -85,10 +107,8 @@ def _add_family_argument(parser: argparse.ArgumentParser, allow_both: bool) -> N
 
 
 def _add_data_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--V", type=int, default=1024)
-    parser.add_argument("--S", type=int, default=384)
-    parser.add_argument("--q", type=int, default=4)
-    parser.add_argument("--key-seed", type=int, default=0)
+    parser.add_argument("--V", type=int, default=None)
+    parser.add_argument("--S", type=int, default=64)
     parser.add_argument("--L", type=int, default=4)
     parser.add_argument("--d", type=int, default=2)
     parser.add_argument(
@@ -100,12 +120,12 @@ def _add_data_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _random_config(args: argparse.Namespace) -> RandomConfig:
-    return RandomConfig(V=args.V, S=args.S, q=args.q, key_seed=args.key_seed)
+    return RandomConfig(V=args.V or 2048, S=args.S)
 
 
 def _dag_config(args: argparse.Namespace) -> DagConfig:
     width = args.W if args.W is not None else args.d + 2
-    return DagConfig(V=args.V, L=args.L, d=args.d, W=width)
+    return DagConfig(V=args.V or 1024, L=args.L, d=args.d, W=width)
 
 
 def _seed(base_seed: int, family: str, split: str) -> int:
@@ -241,8 +261,35 @@ def command_write(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_dag_units(args: argparse.Namespace) -> int:
+    width = args.W if args.W is not None else args.d + 2
+    config = DagConfig(V=args.V, L=args.L, d=args.d, W=width)
+    manifest = write_dag_units(
+        output_dir=args.output_dir,
+        config=config,
+        train_units=args.train_units,
+        test_units=args.test_units,
+        unit_size=args.unit_size,
+        base_seed=args.base_seed,
+    )
+    manifest_path = args.output_dir / "dataset_manifest.json"
+    print(
+        json.dumps(
+            {
+                "dataset_root": str(args.output_dir.resolve()),
+                "manifest": str(manifest_path.resolve()),
+                "train_records": manifest["splits"]["train"]["records"],
+                "test_records": manifest["splits"]["test"]["records"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def command_random_units(args: argparse.Namespace) -> int:
-    config = RandomConfig(V=args.V, S=args.S, q=args.q, key_seed=args.key_seed)
+    config = RandomConfig(V=args.V, S=args.S)
     manifest = write_random_units(
         output_dir=args.output_dir,
         config=config,
@@ -275,6 +322,7 @@ def main() -> int:
         "validate": command_validate,
         "write": command_write,
         "random-units": command_random_units,
+        "dag-units": command_dag_units,
     }
     try:
         return commands[args.command](args)

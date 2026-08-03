@@ -40,26 +40,17 @@ def total_vocab_size(V: int) -> int:
 
 @dataclass(frozen=True)
 class RandomConfig:
-    V: int = 1024
-    S: int = 384
-    q: int = 4
-    key_seed: int = 0
+    V: int = 2048
+    S: int = 64
 
     def __post_init__(self) -> None:
         if self.V < 3:
             raise ValueError("V must be at least 3")
         if self.S <= 0:
             raise ValueError("S must be positive")
-        if self.q < 2:
-            raise ValueError("q must be at least 2")
-
     @property
     def H_R_bits(self) -> float:
         return self.S * math.log2(self.V)
-
-    @property
-    def samples_per_split(self) -> int:
-        return self.V ** (self.q - 1)
 
 
 @dataclass(frozen=True)
@@ -114,46 +105,6 @@ def _sample_rng(
     return np.random.default_rng(sequence)
 
 
-def _coprime_multiplier(seed: int, modulus: int) -> int:
-    candidate = abs(2 * int(seed) + 1) % modulus
-    candidate = max(candidate, 1)
-    while math.gcd(candidate, modulus) != 1:
-        candidate = (candidate + 1) % modulus
-        if candidate == 0:
-            candidate = 1
-    return candidate
-
-
-def _encode_base_V(value: int, V: int, width: int) -> list[int]:
-    digits = [0] * width
-    for index in range(width - 1, -1, -1):
-        value, digit = divmod(value, V)
-        digits[index] = digit
-    if value:
-        raise ValueError("value does not fit in requested base-V width")
-    return digits
-
-
-def make_unique_key(config: RandomConfig, split: str, sample_id: int) -> list[int]:
-    _validate_split(split)
-    if not 0 <= sample_id < config.samples_per_split:
-        raise ValueError(
-            f"sample_id must be below {config.samples_per_split} for q={config.q}"
-        )
-    raw = SPLIT_CODES[split] * config.samples_per_split + sample_id
-    modulus = config.V ** config.q
-    multiplier = _coprime_multiplier(config.key_seed, modulus)
-    offset = (
-        int.from_bytes(
-            hashlib.sha256(str(config.key_seed).encode("ascii")).digest()[:8],
-            "big",
-        )
-        % modulus
-    )
-    permuted = (multiplier * raw + offset) % modulus
-    return _encode_base_V(permuted, config.V, config.q)
-
-
 def _hash_json(value: object) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
@@ -167,18 +118,10 @@ def generate_random_record(
 ) -> dict:
     rng = _sample_rng("random", split, sample_id, seed)
     tokens = special_tokens(config.V)
-    key = make_unique_key(config, split, sample_id)
     target = rng.integers(0, config.V, size=config.S, dtype=np.int64).tolist()
-    prefix = [
-        tokens["BOS"],
-        tokens["RANDOM"],
-        tokens["KEY"],
-        *key,
-        tokens["SEP"],
-    ]
-    answer_start = len(prefix)
+    answer_start = 1
     answer_end = answer_start + config.S
-    input_ids = [*prefix, *target, tokens["EOS"]]
+    input_ids = [tokens["BOS"], *target, tokens["EOS"]]
     return {
         "sample_id": sample_id,
         "family": "random",
@@ -189,8 +132,6 @@ def generate_random_record(
         "input_ids": input_ids,
         "target_ids": target,
         "metadata": {
-            "key": key,
-            "key_hash": _hash_json(key),
             "target_hash": _hash_json(target),
             "answer_start": answer_start,
             "answer_end": answer_end,
@@ -423,8 +364,11 @@ def validate_record(record: Mapping[str, object]) -> list[str]:
         expected = int(record["answer_length"]) * math.log2(int(record["V"]))
         if not math.isclose(float(metadata["H_R_bits"]), expected):
             errors.append("H_R mismatch")
-        if any(not 0 <= int(token) < int(record["V"]) for token in metadata["key"]):
-            errors.append("key token outside effective vocabulary")
+        tokens = special_tokens(int(record["V"]))
+        if input_ids[0] != tokens["BOS"] or input_ids[-1] != tokens["EOS"]:
+            errors.append("random sequence must be delimited by BOS and EOS")
+        if start != 1 or end != len(input_ids) - 1:
+            errors.append("random answer span must cover all sampled tokens")
         return errors
 
     if record["family"] != "dag":
@@ -520,7 +464,7 @@ def run_admission_checks(
     if sqlite_path.exists():
         sqlite_path.unlink()
     connection = sqlite3.connect(sqlite_path)
-    for table in ("identities", "random_keys", "random_targets", "graph_hashes"):
+    for table in ("identities", "random_targets", "graph_hashes"):
         connection.execute(f"CREATE TABLE {table}(value TEXT PRIMARY KEY)")
 
     records_checked = 0
@@ -574,11 +518,7 @@ def run_admission_checks(
                 theoretical_values["H_R_bits"].add(float(metadata["H_R_bits"]))
                 random_token_counts.update(map(int, record["target_ids"]))
                 random_token_total += len(record["target_ids"])
-                identity = f"random:{metadata['key_hash']}:{metadata['target_hash']}"
-                if not _insert_unique(
-                    connection, "random_keys", str(metadata["key_hash"])
-                ):
-                    duplicate_key_count += 1
+                identity = f"random:{metadata['target_hash']}"
                 if not _insert_unique(
                     connection, "random_targets", str(metadata["target_hash"])
                 ):

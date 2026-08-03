@@ -107,7 +107,7 @@ class ModelAndTrainingTests(unittest.TestCase):
         from phase_c.data.core import RandomConfig, generate_random_record
         from phase_c.training import FileRandomRecordDataset
 
-        config = RandomConfig(V=32, S=6, q=4)
+        config = RandomConfig(V=32, S=6)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             train = root / "train"
@@ -139,7 +139,7 @@ class ModelAndTrainingTests(unittest.TestCase):
                 "--model",
                 "L4_H128",
                 "--dataset-root",
-                "phase_c_random_data/V1024_S32_q4_seed20260715",
+                "phase_c_random_data/V2048_S64_seed20260715",
                 "--train-units",
                 "5",
                 "--test-units",
@@ -150,13 +150,13 @@ class ModelAndTrainingTests(unittest.TestCase):
         self.assertEqual(args.model, "L4_H128")
         self.assertEqual(args.train_units, 5)
         self.assertEqual(args.test_units, 2)
-        self.assertEqual(args.dataset_root.parts[-1], "V1024_S32_q4_seed20260715")
+        self.assertEqual(args.dataset_root.parts[-1], "V2048_S64_seed20260715")
 
     def test_answer_only_labels_and_capacity_formula(self):
         from phase_c.data.core import RandomConfig, generate_random_record, special_tokens
         from phase_c.training import AnswerOnlyCollator, random_capacity_metrics
 
-        record = generate_random_record(RandomConfig(V=32, S=6, q=4), "train", 0, 9)
+        record = generate_random_record(RandomConfig(V=32, S=6), "train", 0, 9)
         batch = AnswerOnlyCollator(special_tokens(32)["PAD"])([record])
         positions = torch.nonzero(batch["labels"][0] != -100).flatten().tolist()
         start = record["metadata"]["answer_start"]
@@ -168,10 +168,23 @@ class ModelAndTrainingTests(unittest.TestCase):
             supervised_tokens=20,
             num_samples=5,
             H_R_bits_per_sample=32,
-            non_embedding_parameters=10,
+            parameter_counts={"total": 20, "non_embedding": 10},
         )
         self.assertAlmostEqual(metrics["memory_bits"], 60)
-        self.assertAlmostEqual(metrics["bits_per_parameter"], 6)
+        self.assertAlmostEqual(metrics["bits_per_parameter"], 3)
+        self.assertAlmostEqual(metrics["bits_per_total_parameter"], 3)
+        self.assertAlmostEqual(metrics["bits_per_non_embedding_parameter"], 6)
+
+    def test_train_parser_defaults_to_paper_style_optimization(self):
+        from phase_c.experiments.e03_random_capacity.train import build_parser
+
+        args = build_parser().parse_args([])
+
+        self.assertEqual((args.V, args.S), (2048, 64))
+        self.assertEqual(args.max_steps, 1_000_000)
+        self.assertIsNone(args.epochs)
+        self.assertEqual((args.micro_batch_size, args.gradient_accumulation), (8, 128))
+        self.assertEqual((args.weight_decay, args.beta1, args.beta2), (0.0, 0.9, 0.999))
 
     def test_checkpoint_round_trip(self):
         from phase_c.models import DecoderOnlyTransformer, ModelConfig

@@ -7,26 +7,32 @@ from pathlib import Path
 
 
 class RandomGenerationTests(unittest.TestCase):
-    def test_random_record_has_unique_key_and_answer_only_span(self):
-        from phase_c.data.core import RandomConfig, generate_random_record
+    def test_random_record_is_a_paper_style_independent_token_sequence(self):
+        from phase_c.data.core import RandomConfig, generate_random_record, special_tokens
 
-        config = RandomConfig(V=1024, S=384, q=4, key_seed=17)
+        config = RandomConfig(V=32, S=6)
         train = generate_random_record(config, "train", sample_id=9, seed=101)
-        validation = generate_random_record(
-            config, "validation", sample_id=9, seed=202
-        )
 
-        self.assertNotEqual(train["metadata"]["key"], validation["metadata"]["key"])
+        tokens = special_tokens(32)
+        self.assertEqual(train["input_ids"][0], tokens["BOS"])
+        self.assertEqual(train["input_ids"][-1], tokens["EOS"])
+        self.assertEqual(train["input_ids"][1:-1], train["target_ids"])
+        self.assertNotIn("key", train["metadata"])
         start = train["metadata"]["answer_start"]
         end = train["metadata"]["answer_end"]
         self.assertEqual(train["input_ids"][start:end], train["target_ids"])
-        self.assertEqual(len(train["target_ids"]), 384)
-        self.assertEqual(train["metadata"]["H_R_bits"], 3840.0)
+        self.assertEqual((start, end), (1, 7))
+        self.assertEqual(train["metadata"]["H_R_bits"], 30.0)
+
+    def test_random_defaults_match_the_paper_protocol(self):
+        from phase_c.data.core import RandomConfig
+
+        self.assertEqual(RandomConfig(), RandomConfig(V=2048, S=64))
 
     def test_random_generation_is_deterministic(self):
         from phase_c.data.core import RandomConfig, generate_random_record
 
-        config = RandomConfig(V=64, S=12, q=4, key_seed=5)
+        config = RandomConfig(V=64, S=12)
         first = generate_random_record(config, "test", 123, 999)
         second = generate_random_record(config, "test", 123, 999)
         self.assertEqual(first, second)
@@ -102,7 +108,7 @@ class AdmissionTests(unittest.TestCase):
         )
 
         records = []
-        random_config = RandomConfig(V=64, S=8, q=4)
+        random_config = RandomConfig(V=64, S=8)
         dag_config = DagConfig(V=128, L=3, d=2, W=4)
         for split_index, split in enumerate(("train", "validation", "test")):
             for sample_id in range(20):
@@ -133,7 +139,7 @@ class AdmissionTests(unittest.TestCase):
             run_admission_checks,
         )
 
-        record = generate_random_record(RandomConfig(V=32, S=6, q=4), "train", 1, 9)
+        record = generate_random_record(RandomConfig(V=32, S=6), "train", 1, 9)
         with tempfile.TemporaryDirectory() as temp_dir:
             report = run_admission_checks(
                 [record, record], sqlite_path=Path(temp_dir) / "admission.sqlite"
@@ -151,7 +157,7 @@ class AdmissionTests(unittest.TestCase):
         )
 
         records = generate_records(
-            "random", RandomConfig(V=32, S=6, q=4), "train", 7, seed=4
+            "random", RandomConfig(V=32, S=6), "train", 7, seed=4
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             manifest = write_jsonl_gzip_shards(
@@ -249,8 +255,6 @@ class CliTests(unittest.TestCase):
                 "32",
                 "--S",
                 "6",
-                "--q",
-                "4",
                 "--unit-size",
                 "3",
                 "--train-units",
