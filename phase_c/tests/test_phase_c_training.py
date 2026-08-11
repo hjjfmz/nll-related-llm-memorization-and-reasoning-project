@@ -6,9 +6,21 @@ import unittest
 from pathlib import Path
 
 import torch
+from unittest.mock import patch
 
 
 class ModelAndTrainingTests(unittest.TestCase):
+    def test_checkpoint_restores_only_available_cuda_rng_states(self):
+        from phase_c.training.checkpoint import _restore_cuda_rng_states
+
+        restored = []
+        with patch("torch.cuda.device_count", return_value=1), patch(
+            "torch.cuda.set_rng_state", side_effect=lambda state, device: restored.append(device)
+        ):
+            _restore_cuda_rng_states([torch.tensor([1]), torch.tensor([2])])
+
+        self.assertEqual(restored, [0])
+
     def test_training_package_exposes_core_components(self):
         from phase_c.training.checkpoint import load_checkpoint, save_checkpoint
         from phase_c.training.collation import AnswerOnlyCollator

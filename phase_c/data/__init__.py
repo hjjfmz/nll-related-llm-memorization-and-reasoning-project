@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from phase_c.data.core import (
     DagConfig,
+    DAG_TASKS,
     RandomConfig,
     config_to_dict,
     generate_dag_record,
     generate_random_record,
     generate_records,
+    materialize_dag_task,
     random_unit_paths,
     read_jsonl_gzip,
     special_tokens,
@@ -17,12 +19,14 @@ from phase_c.data.random_units import write_random_units
 
 __all__ = [
     "DagConfig",
+    "DAG_TASKS",
     "RandomConfig",
     "special_tokens",
     "total_vocab_size",
     "generate_random_record",
     "generate_dag_record",
     "generate_records",
+    "materialize_dag_task",
     "random_unit_paths",
     "read_jsonl_gzip",
     "config_to_dict",

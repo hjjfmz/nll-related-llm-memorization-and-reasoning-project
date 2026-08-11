@@ -49,6 +49,12 @@ def _coerce_cuda_rng_state_all(states: object) -> list[torch.Tensor]:
     return [_coerce_rng_state(state) for state in states]
 
 
+def _restore_cuda_rng_states(states: object) -> None:
+    saved_states = _coerce_cuda_rng_state_all(states)
+    for device_index, rng_state in enumerate(saved_states[: torch.cuda.device_count()]):
+        torch.cuda.set_rng_state(rng_state, device=device_index)
+
+
 def load_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -66,7 +72,5 @@ def load_checkpoint(
     torch.set_rng_state(_coerce_rng_state(state["torch_rng_state"]))
     random.setstate(state["python_rng_state"])
     if torch.cuda.is_available() and "cuda_rng_state_all" in state:
-        torch.cuda.set_rng_state_all(
-            _coerce_cuda_rng_state_all(state["cuda_rng_state_all"])
-        )
+        _restore_cuda_rng_states(state["cuda_rng_state_all"])
     return {"step": int(state["step"]), "run_config": state["run_config"]}

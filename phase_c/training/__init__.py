@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from phase_c.training.checkpoint import load_checkpoint, save_checkpoint
-from phase_c.training.collation import AnswerOnlyCollator
+from phase_c.training.collation import AnswerOnlyCollator, DagTaskCollator
 from phase_c.training.datasets import (
     DagRecordDataset,
     FileDagRecordDataset,
@@ -9,7 +9,6 @@ from phase_c.training.datasets import (
     RandomRecordDataset,
 )
 from phase_c.training.evaluation import (
-    dag_reasoning_metrics,
     evaluate_dag_model,
     evaluate_random_model,
     random_capacity_metrics,
@@ -19,6 +18,7 @@ from phase_c.training.stream import SampleStream
 
 __all__ = [
     "AnswerOnlyCollator",
+    "DagTaskCollator",
     "RandomRecordDataset",
     "FileRandomRecordDataset",
     "DagRecordDataset",
@@ -27,7 +27,6 @@ __all__ = [
     "causal_lm_loss",
     "random_capacity_metrics",
     "evaluate_random_model",
-    "dag_reasoning_metrics",
     "evaluate_dag_model",
     "save_checkpoint",
     "load_checkpoint",

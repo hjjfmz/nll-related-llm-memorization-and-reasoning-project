@@ -12,10 +12,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from phase_c.data.core import DagConfig, special_tokens, total_vocab_size
+from phase_c.data.core import DAG_TASKS, DagConfig, special_tokens, total_vocab_size
 from phase_c.models import MODEL_PRESETS, DecoderOnlyTransformer, count_parameters
 from phase_c.training import (
-    AnswerOnlyCollator,
+    DagTaskCollator,
     DagRecordDataset,
     FileDagRecordDataset,
     SampleStream,
@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="From-scratch DAG path-reasoning depth-limit measurement (E4)."
     )
     parser.add_argument("--model", choices=tuple(MODEL_PRESETS), default="L4_H128")
+    parser.add_argument("--task", choices=DAG_TASKS, required=True)
     parser.add_argument("--V", type=int, default=2048)
     parser.add_argument(
         "--L", type=int, default=4, help="DAG path depth (number of answer tokens)"
@@ -52,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d", type=int, default=2, help="per-node out-degree / branch factor")
     parser.add_argument("--W", type=int, default=None, help="layer width; defaults to d+2")
     parser.add_argument("--train-size", type=int, default=100_000)
+    parser.add_argument("--validation-size", type=int, default=10_000)
     parser.add_argument("--test-size", type=int, default=20_000)
     parser.add_argument(
         "--dataset-root",
@@ -66,12 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of 1k train unit files to read from dataset-root/train.",
     )
     parser.add_argument(
+        "--validation-units",
+        type=int,
+        default=None,
+        help="Number of 1k validation unit files to read from dataset-root/validation.",
+    )
+    parser.add_argument(
         "--test-units",
         type=int,
         default=None,
         help="Number of 1k test unit files to read from dataset-root/test.",
     )
     parser.add_argument("--train-seed", type=int, default=20270616)
+    parser.add_argument("--validation-seed", type=int, default=20270617)
     parser.add_argument("--test-seed", type=int, default=20270617)
     parser.add_argument("--sampling-seed", type=int, default=20270618)
     parser.add_argument("--model-seed", type=int, default=20270619)
@@ -99,13 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-interval",
         type=int,
         default=1_000,
-        help="run a test monitor eval every this many steps (grokking signal); 0 disables",
+        help="run a validation monitor eval every this many steps; 0 disables",
     )
     parser.add_argument(
         "--monitor-eval-size",
         type=int,
         default=2_000,
-        help="number of test samples per periodic monitor eval",
+        help="number of validation samples per periodic monitor eval",
     )
     parser.add_argument(
         "--edge-reorder-seed",
@@ -153,24 +162,37 @@ def _dag_config(args: argparse.Namespace) -> DagConfig:
 
 def _build_datasets(
     args: argparse.Namespace,
-) -> tuple[DagRecordDataset | FileDagRecordDataset, DagRecordDataset | FileDagRecordDataset, DagConfig]:
+) -> tuple[
+    DagRecordDataset | FileDagRecordDataset,
+    DagRecordDataset | FileDagRecordDataset,
+    DagRecordDataset | FileDagRecordDataset,
+    DagConfig,
+]:
     if args.dataset_root is None:
         data_config = _dag_config(args)
         train_dataset = DagRecordDataset(
             data_config, "train", args.train_size, args.train_seed
         )
+        validation_dataset = DagRecordDataset(
+            data_config, "validation", args.validation_size, args.validation_seed
+        )
         test_dataset = DagRecordDataset(
             data_config, "test", args.test_size, args.test_seed
         )
-        return train_dataset, test_dataset, data_config
+        return train_dataset, validation_dataset, test_dataset, data_config
 
-    if args.train_units is None or args.test_units is None:
-        raise ValueError("dataset-root requires both --train-units and --test-units")
+    if args.train_units is None or args.validation_units is None or args.test_units is None:
+        raise ValueError(
+            "dataset-root requires --train-units, --validation-units, and --test-units"
+        )
     train_dataset = FileDagRecordDataset(args.dataset_root, "train", args.train_units)
+    validation_dataset = FileDagRecordDataset(
+        args.dataset_root, "validation", args.validation_units
+    )
     test_dataset = FileDagRecordDataset(args.dataset_root, "test", args.test_units)
-    if train_dataset.config != test_dataset.config:
-        raise ValueError("train and test file-backed datasets have different configs")
-    return train_dataset, test_dataset, train_dataset.config
+    if len({train_dataset.config, validation_dataset.config, test_dataset.config}) != 1:
+        raise ValueError("file-backed DAG splits have different configs")
+    return train_dataset, validation_dataset, test_dataset, train_dataset.config
 
 
 def run(args: argparse.Namespace) -> dict | None:
@@ -190,7 +212,7 @@ def run(args: argparse.Namespace) -> dict | None:
             torch.set_float32_matmul_precision("high")
             torch.cuda.reset_peak_memory_stats(device)
 
-        train_dataset, test_dataset, data_config = _build_datasets(args)
+        train_dataset, validation_dataset, test_dataset, data_config = _build_datasets(args)
         model_config = MODEL_PRESETS[args.model]
         sequence_length = data_config.sequence_length
         if sequence_length > model_config.context_length:
@@ -199,7 +221,7 @@ def run(args: argparse.Namespace) -> dict | None:
                 f"{model_config.context_length}"
             )
 
-        collator = AnswerOnlyCollator(special_tokens(data_config.V)["PAD"])
+        collator = DagTaskCollator(special_tokens(data_config.V)["PAD"], args.task)
         stream = SampleStream(len(train_dataset), args.sampling_seed)
         base_model = DecoderOnlyTransformer(
             model_config, total_vocab_size(data_config.V)
@@ -263,8 +285,7 @@ def run(args: argparse.Namespace) -> dict | None:
                     "arguments": run_config,
                     "model": model_config.to_dict(),
                     "parameters": parameter_counts,
-                    "H_R_bits_per_sample": data_config.L * math.log2(data_config.V),
-                    "H_L_bits_per_sample": data_config.H_L_bits,
+                    "branching_reference_bits": data_config.H_L_bits,
                     "sequence_length": sequence_length,
                     "per_rank_effective_batch_size": per_rank_effective_batch,
                     "global_effective_batch_size": global_effective_batch,
@@ -372,8 +393,9 @@ def run(args: argparse.Namespace) -> dict | None:
             ):
                 monitor = evaluate_dag_model(
                     unwrap_model(model),
-                    test_dataset,
+                    validation_dataset,
                     collator,
+                    args.task,
                     args.eval_batch_size,
                     device,
                     dtype,
@@ -382,12 +404,16 @@ def run(args: argparse.Namespace) -> dict | None:
                 eval_entry = {
                     "step": step,
                     "epoch": stream.epoch + stream.position / stream.size,
-                    "nll_bits_per_token": monitor["nll_bits_per_token"],
-                    "lambda": monitor["lambda"],
-                    "em": monitor["em"],
-                    "path_validity_rate": monitor["path_validity_rate"],
+                    "teacher_forced_nll_bits_per_token": monitor[
+                        "teacher_forced_nll_bits_per_token"
+                    ],
                     "elapsed_seconds": time.perf_counter() - started,
                 }
+                if args.task == "outcome":
+                    eval_entry["first_hop_accuracy"] = monitor["first_hop_accuracy"]
+                else:
+                    eval_entry["free_run_trace_em"] = monitor["free_run_trace_em"]
+                    eval_entry["path_validity_rate"] = monitor["path_validity_rate"]
                 append_jsonl(args.output_dir / "eval_log.jsonl", eval_entry)
                 print("EVAL " + json.dumps(eval_entry, ensure_ascii=False), flush=True)
 
@@ -414,6 +440,17 @@ def run(args: argparse.Namespace) -> dict | None:
             unwrap_model(model),
             train_dataset,
             collator,
+            args.task,
+            args.eval_batch_size,
+            device,
+            dtype,
+            args.eval_size,
+        )
+        validation_metrics = evaluate_dag_model(
+            unwrap_model(model),
+            validation_dataset,
+            collator,
+            args.task,
             args.eval_batch_size,
             device,
             dtype,
@@ -423,6 +460,7 @@ def run(args: argparse.Namespace) -> dict | None:
             unwrap_model(model),
             test_dataset,
             collator,
+            args.task,
             args.eval_batch_size,
             device,
             dtype,
@@ -431,6 +469,7 @@ def run(args: argparse.Namespace) -> dict | None:
         metrics = {
             "completed_steps": completed_steps,
             "train": train_metrics,
+            "validation": validation_metrics,
             "test": test_metrics,
             "parameters": parameter_counts,
             "config": {
@@ -438,17 +477,17 @@ def run(args: argparse.Namespace) -> dict | None:
                 "L": data_config.L,
                 "d": data_config.d,
                 "W": data_config.W,
-                "H_L_bits": data_config.H_L_bits,
-                "H_R_bits": data_config.L * math.log2(data_config.V),
+                "branching_reference_bits": data_config.H_L_bits,
                 "sequence_length": sequence_length,
             },
-            "formal_capacity_evaluation": train_metrics["samples"] == len(train_dataset),
+            "formal_dag_evaluation": test_metrics["samples"] == len(test_dataset),
         }
         if args.edge_reorder_seed is not None:
             metrics["test_edge_reordered"] = evaluate_dag_model(
                 unwrap_model(model),
                 test_dataset,
                 collator,
+                args.task,
                 args.eval_batch_size,
                 device,
                 dtype,

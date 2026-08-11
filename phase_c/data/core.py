@@ -17,6 +17,7 @@ import numpy as np
 
 SPLIT_CODES = {"train": 0, "validation": 1, "test": 2}
 FAMILY_CODES = {"random": 101, "dag": 211}
+DAG_TASKS = ("outcome", "trace")
 SPECIAL_NAMES = (
     "PAD",
     "BOS",
@@ -85,7 +86,7 @@ class DagConfig:
 
     @property
     def sequence_length(self) -> int:
-        return 2 * self.edge_count + self.L + 7
+        return 2 * self.edge_count + self.L + 6
 
 
 def _validate_split(split: str) -> None:
@@ -194,10 +195,7 @@ def generate_dag_record(
         path[-1],
         tokens["ANSWER"],
     ]
-    target = path[1:]
-    answer_start = len(prefix)
-    answer_end = answer_start + config.L
-    input_ids = [*prefix, *target, tokens["EOS"]]
+    target = path[1:-1]
     graph_identity = {
         "edges": sorted([list(edge) for edge in edges]),
         "source": path[0],
@@ -209,15 +207,15 @@ def generate_dag_record(
         "split": split,
         "seed": seed,
         "V": config.V,
-        "answer_length": config.L,
-        "input_ids": input_ids,
+        "answer_length": len(target),
+        "input_ids": prefix,
         "target_ids": target,
         "metadata": {
             "L": config.L,
             "d": config.d,
             "b_i": [1] * config.L,
             "W": config.W,
-            "H_L_bits": config.H_L_bits,
+            "branching_reference_bits": config.H_L_bits,
             "layers": layers,
             "path": path,
             "source": path[0],
@@ -225,8 +223,7 @@ def generate_dag_record(
             "edges": [list(edge) for edge in edges],
             "serialized_edges": [list(edge) for edge in serialized_edges],
             "graph_hash": _hash_json(graph_identity),
-            "answer_start": answer_start,
-            "answer_end": answer_end,
+            "prompt_length": len(prefix),
             "node_count": node_count_from_layers(layers),
             "edge_count": len(edges),
         },
@@ -246,9 +243,8 @@ def parse_dag_sequence(input_ids: Sequence[int], V: int) -> dict:
     try:
         query_index = input_ids.index(tokens["QUERY"], 2)
         answer_index = input_ids.index(tokens["ANSWER"], query_index + 1)
-        eos_index = input_ids.index(tokens["EOS"], answer_index + 1)
     except ValueError as exc:
-        raise ValueError("DAG sequence is missing QUERY, ANSWER, or EOS") from exc
+        raise ValueError("DAG sequence is missing QUERY or ANSWER") from exc
     flat_edges = list(input_ids[2:query_index])
     if len(flat_edges) % 2:
         raise ValueError("edge token count must be even")
@@ -258,11 +254,31 @@ def parse_dag_sequence(input_ids: Sequence[int], V: int) -> dict:
         (flat_edges[index], flat_edges[index + 1])
         for index in range(0, len(flat_edges), 2)
     ]
+    answer = list(input_ids[answer_index + 1 :])
+    if tokens["EOS"] in answer:
+        answer = answer[: answer.index(tokens["EOS"])]
     return {
         "edges": edges,
         "source": input_ids[query_index + 1],
         "target": input_ids[query_index + 2],
-        "answer": list(input_ids[answer_index + 1:eos_index]),
+        "answer": answer,
+    }
+
+
+def materialize_dag_task(record: Mapping[str, object], task: str) -> dict:
+    if task not in DAG_TASKS:
+        raise ValueError(f"task must be one of {DAG_TASKS}, got {task!r}")
+    if record["family"] != "dag":
+        raise ValueError("DAG task materialization requires a DAG record")
+    path = list(map(int, record["metadata"]["path"]))
+    target_ids = [path[1]] if task == "outcome" else path[1:-1]
+    if not target_ids:
+        raise ValueError("DAG task requires L >= 2")
+    return {
+        "prompt_ids": list(map(int, record["input_ids"])),
+        "target_ids": target_ids,
+        "task": task,
+        "record": record,
     }
 
 
@@ -282,16 +298,11 @@ def reorder_dag_edges(record: Mapping[str, object], seed: int) -> dict:
         parsed["source"],
         parsed["target"],
         tokens["ANSWER"],
-        *parsed["answer"],
-        tokens["EOS"],
     ]
     copied = json.loads(json.dumps(record))
     copied["input_ids"] = input_ids
     copied["metadata"]["serialized_edges"] = [list(edge) for edge in edges]
-    copied["metadata"]["answer_start"] = input_ids.index(tokens["ANSWER"]) + 1
-    copied["metadata"]["answer_end"] = copied["metadata"]["answer_start"] + len(
-        parsed["answer"]
-    )
+    copied["metadata"]["prompt_length"] = len(input_ids)
     return copied
 
 
@@ -351,16 +362,15 @@ def validate_record(record: Mapping[str, object]) -> list[str]:
     input_ids = list(record["input_ids"])
     target_ids = list(record["target_ids"])
     metadata = record["metadata"]
-    start = int(metadata["answer_start"])
-    end = int(metadata["answer_end"])
-    if input_ids[start:end] != target_ids:
-        errors.append("serialized answer span differs from target_ids")
-    if end - start != int(record["answer_length"]):
-        errors.append("answer length mismatch")
-    if any(not 0 <= token < int(record["V"]) for token in target_ids):
-        errors.append("target token outside effective vocabulary")
-
     if record["family"] == "random":
+        start = int(metadata["answer_start"])
+        end = int(metadata["answer_end"])
+        if input_ids[start:end] != target_ids:
+            errors.append("serialized answer span differs from target_ids")
+        if end - start != int(record["answer_length"]):
+            errors.append("answer length mismatch")
+        if any(not 0 <= token < int(record["V"]) for token in target_ids):
+            errors.append("target token outside effective vocabulary")
         expected = int(record["answer_length"]) * math.log2(int(record["V"]))
         if not math.isclose(float(metadata["H_R_bits"]), expected):
             errors.append("H_R mismatch")
@@ -409,19 +419,19 @@ def validate_record(record: Mapping[str, object]) -> list[str]:
     nonpath_nodes = set(layer_of) - path_nodes
     if nonpath_nodes.intersection(reverse_reachable):
         errors.append("nonpath node can reach target")
-    if target_ids != path[1:]:
-        errors.append("target_ids differ from path successors")
+    if target_ids != path[1:-1]:
+        errors.append("target_ids differ from path intermediates")
     expected_h_l = L * math.log2(d)
-    if not math.isclose(float(metadata["H_L_bits"]), expected_h_l):
-        errors.append("H_L mismatch")
+    if not math.isclose(float(metadata["branching_reference_bits"]), expected_h_l):
+        errors.append("branching reference mismatch")
     try:
         parsed = parse_dag_sequence(input_ids, int(record["V"]))
         if set(parsed["edges"]) != set(edges):
             errors.append("serialized edge set differs from metadata")
         if parsed["source"] != path[0] or parsed["target"] != path[-1]:
             errors.append("serialized query differs from metadata")
-        if parsed["answer"] != target_ids:
-            errors.append("serialized answer differs from target_ids")
+        if parsed["answer"]:
+            errors.append("canonical DAG prompt must not contain answer tokens")
     except ValueError as exc:
         errors.append(str(exc))
     return errors
@@ -480,7 +490,7 @@ def run_admission_checks(
     target_lengths: list[int] = []
     theoretical_values: dict[str, set[float]] = {
         "H_R_bits": set(),
-        "H_L_bits": set(),
+        "branching_reference_bits": set(),
     }
     graph_node_counts: set[int] = set()
     graph_edge_counts: set[int] = set()
@@ -524,7 +534,9 @@ def run_admission_checks(
                 ):
                     duplicate_target_count += 1
             elif family == "dag":
-                theoretical_values["H_L_bits"].add(float(metadata["H_L_bits"]))
+                theoretical_values["branching_reference_bits"].add(
+                    float(metadata["branching_reference_bits"])
+                )
                 graph_node_counts.add(int(metadata["node_count"]))
                 graph_edge_counts.add(int(metadata["edge_count"]))
                 path_nodes = set(map(int, metadata["path"]))

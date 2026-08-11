@@ -184,7 +184,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli
 ```bash
 python -m phase_c.cli dag gen-data \
   --V 2048 --L 4 --d 2 \
-  --unit-size 1000 --train-units 100 --test-units 20 \
+  --unit-size 1000 --train-units 100 --validation-units 10 --test-units 20 \
   --base-seed 20260715 \
   --output-dir phase_c_dag_data/V2048_L4_d2_seed20260715
 ```
@@ -193,9 +193,10 @@ python -m phase_c.cli dag gen-data \
 
 ```bash
 python -m phase_c.cli dag train \
+  --task outcome \
   --model L4_H128 \
   --dataset-root phase_c_dag_data/V2048_L4_d2_seed20260715 \
-  --train-units 100 --test-units 20 \
+  --train-units 100 --validation-units 10 --test-units 20 \
   --max-steps 100000 \
   --eval-interval 1000 --monitor-eval-size 2000 \
   --output-dir phase_c_runs/dag_L4_H128_depth4_d2
@@ -210,7 +211,7 @@ python -m phase_c.cli dag eval \
   --output-dir phase_c_runs/dag_L4_H128_depth4_d2_eval
 ```
 
-E4 核心指标（`final_metrics.json` 的 `test` 字段）：`lambda=(nll_bits_per_sample−H_L)/L`、`em`、`stepwise_conditional_accuracy`、`path_validity_rate`、`solver_em`（确定性求解器上界，正常应为 1.0）。
+E4 在同一批图上配对运行两个任务：`outcome` 仅预测首跳，`trace` 预测中间节点。`final_metrics.json` 将 teacher-forced NLL 与 free-run 指标分开：outcome 输出 `first_hop_accuracy` 和 `random_choice_accuracy`；trace 输出 `free_run_trace_em`、`stepwise_accuracy`、`first_error_position_mean`、`path_validity_rate`。`branching_reference_bits` 仅为元数据；E4 不输出 `lambda` 或 `memory_bits`。
 
 ---
 

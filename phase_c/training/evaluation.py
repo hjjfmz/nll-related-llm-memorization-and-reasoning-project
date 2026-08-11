@@ -7,8 +7,14 @@ from typing import Sequence
 
 import torch
 
-from phase_c.data.core import DagConfig, reorder_dag_edges, solve_unique_path
-from phase_c.training.collation import AnswerOnlyCollator
+from phase_c.data.core import (
+    DAG_TASKS,
+    DagConfig,
+    materialize_dag_task,
+    reorder_dag_edges,
+    solve_unique_path,
+)
+from phase_c.training.collation import AnswerOnlyCollator, DagTaskCollator
 from phase_c.training.datasets import RandomRecordDataset
 from phase_c.training.losses import causal_lm_loss
 
@@ -57,10 +63,7 @@ def evaluate_random_model(
     total_nll_nats = 0.0
     supervised_tokens = 0
     for start in range(0, sample_count, batch_size):
-        records = [
-            dataset[index]
-            for index in range(start, min(start + batch_size, sample_count))
-        ]
+        records = [dataset[index] for index in range(start, min(start + batch_size, sample_count))]
         batch = collator(records)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -80,64 +83,15 @@ def evaluate_random_model(
     return metrics
 
 
-def dag_reasoning_metrics(
-    total_nll_nats: float,
-    supervised_tokens: int,
-    num_samples: int,
-    config: DagConfig,
-    em_correct: int,
-    marginal_correct: Sequence[int],
-    conditional_correct: Sequence[int],
-    first_error_sum: int,
-    valid_path_count: int,
-    solver_correct_count: int,
-) -> dict[str, float]:
-    """Aggregate per-sample DAG eval counters into reasoning metrics.
-
-    - ``nll_bits_per_sample``: mean answer-token NLL in bits per sample.
-    - ``lambda`` = ``(nll_bits_per_sample - H_L) / L``: extra bits per depth
-      step beyond the pure-logic lower bound ``H_L = L log2(d)``.
-    - ``em``: exact path match rate; ``path_validity_rate``: decoded path is a
-      real source->target path; ``solver_em``: deterministic solver upper bound.
-    """
-    L = config.L
-    total_nll_bits = total_nll_nats / math.log(2.0)
-    nll_bits_per_sample = total_nll_bits / num_samples
-    H_L = config.H_L_bits
-    H_R = L * math.log2(config.V)
-    return {
-        "total_nll_bits": total_nll_bits,
-        "nll_bits_per_token": total_nll_bits / supervised_tokens,
-        "nll_bits_per_sample": nll_bits_per_sample,
-        "H_L_bits": H_L,
-        "H_R_bits": H_R,
-        "lambda": (nll_bits_per_sample - H_L) / L,
-        "memory_bits": num_samples * H_R - total_nll_bits,
-        "em": em_correct / num_samples,
-        "stepwise_marginal_accuracy": [c / num_samples for c in marginal_correct],
-        "stepwise_conditional_accuracy": [c / num_samples for c in conditional_correct],
-        "stepwise_marginal_accuracy_mean": sum(marginal_correct) / (num_samples * L),
-        "stepwise_conditional_accuracy_mean": sum(conditional_correct)
-        / (num_samples * L),
-        "first_error_position_mean": first_error_sum / num_samples,
-        "path_validity_rate": valid_path_count / num_samples,
-        "random_choice_step_accuracy": 1.0 / config.d,
-        "random_choice_em_baseline": (1.0 / config.d) ** L,
-        "solver_em": solver_correct_count / num_samples,
-        "samples": num_samples,
-        "supervised_tokens": supervised_tokens,
-    }
-
-
-def _is_valid_decoded_path(record: Mapping, decoded: Sequence[int]) -> bool:
+def _is_valid_generated_trace(record: Mapping, generated: Sequence[int]) -> bool:
     edges = {tuple(edge) for edge in record["metadata"]["edges"]}
     current = int(record["metadata"]["source"])
     target = int(record["metadata"]["target"])
-    for node in decoded:
+    for node in [*generated, target]:
         if (current, node) not in edges:
             return False
         current = node
-    return current == target
+    return True
 
 
 def _solver_correct(record: Mapping) -> bool:
@@ -149,43 +103,71 @@ def _solver_correct(record: Mapping) -> bool:
         )
     except ValueError:
         return False
-    return list(path[1:]) == list(record["target_ids"])
+    return list(path) == list(record["metadata"]["path"])
+
+
+@torch.inference_mode()
+def _generate_dag_targets(
+    model: torch.nn.Module,
+    records: Sequence[Mapping[str, object]],
+    task: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[list[int]]:
+    examples = [materialize_dag_task(record, task) for record in records]
+    prompt_lengths = {len(example["prompt_ids"]) for example in examples}
+    target_lengths = {len(example["target_ids"]) for example in examples}
+    if len(prompt_lengths) != 1 or len(target_lengths) != 1:
+        raise ValueError("DAG free-run batches require matching prompt and target lengths")
+    tokens = torch.tensor([example["prompt_ids"] for example in examples], device=device)
+    generated: list[list[int]] = [[] for _ in examples]
+    for _ in range(target_lengths.pop()):
+        with _autocast_context(device, dtype):
+            logits = model(tokens)
+        next_tokens = logits[:, -1, :].float().argmax(-1)
+        for row, token in enumerate(next_tokens.tolist()):
+            generated[row].append(token)
+        tokens = torch.cat((tokens, next_tokens[:, None]), dim=1)
+    return generated
+
+
+def _first_error_position(decoded: Sequence[int], target: Sequence[int]) -> int:
+    for position, (prediction, expected) in enumerate(zip(decoded, target, strict=True)):
+        if prediction != expected:
+            return position + 1
+    return len(target) + 1
 
 
 @torch.inference_mode()
 def evaluate_dag_model(
     model: torch.nn.Module,
     dataset: object,
-    collator: AnswerOnlyCollator,
+    collator: DagTaskCollator,
+    task: str,
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
     max_samples: int = 0,
     reorder_edges_seed: int | None = None,
-) -> dict[str, float]:
-    """Evaluate a model on DAG records.
-
-    Computes answer-token NLL plus greedy-decoding metrics (EM, stepwise,
-    first-error position, path validity).  With ``reorder_edges_seed`` every
-    record is edge-reordered before evaluation (edge-order invariance control).
-    """
+) -> dict[str, object]:
+    """Report teacher-forced NLL separately from true free-run predictions."""
+    if task not in DAG_TASKS:
+        raise ValueError(f"task must be one of {DAG_TASKS}, got {task!r}")
     sample_count = len(dataset) if max_samples == 0 else min(max_samples, len(dataset))
-    config = dataset.config
-    L = config.L
+    config: DagConfig = dataset.config
     model.eval()
     total_nll_nats = 0.0
     supervised_tokens = 0
-    em_correct = 0
-    marginal_correct = [0] * L
-    conditional_correct = [0] * L
+    first_hop_correct = 0
+    trace_em_correct = 0
+    stepwise_correct: list[int] | None = None
     first_error_sum = 0
     valid_path_count = 0
     solver_correct_count = 0
 
     for start in range(0, sample_count, batch_size):
-        indices = range(start, min(start + batch_size, sample_count))
-        records: list[dict] = []
-        for index in indices:
+        records = []
+        for index in range(start, min(start + batch_size, sample_count)):
             record = dataset[index]
             if reorder_edges_seed is not None:
                 record = reorder_dag_edges(record, reorder_edges_seed + index)
@@ -194,50 +176,50 @@ def evaluate_dag_model(
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         with _autocast_context(device, dtype):
-            logits = model(input_ids)
-            loss_sum = causal_lm_loss(logits, labels, reduction="sum")
+            loss_sum = causal_lm_loss(model(input_ids), labels, reduction="sum")
         total_nll_nats += float(loss_sum)
         supervised_tokens += int(batch["supervised_tokens"])
-        logits = logits.float()
-        for row, record in enumerate(records):
-            target = list(record["target_ids"])
-            answer_start = int(record["metadata"]["answer_start"])
-            decoded = logits[
-                row, answer_start - 1 : answer_start - 1 + L
-            ].argmax(-1).tolist()
-            if decoded == target:
-                em_correct += 1
-            ok_prefix = True
-            for position in range(L):
-                if ok_prefix and decoded[position] == target[position]:
-                    conditional_correct[position] += 1
-                    marginal_correct[position] += 1
-                else:
-                    ok_prefix = False
-                    if decoded[position] == target[position]:
-                        marginal_correct[position] += 1
-            first_error_sum += _first_error_position(decoded, target, L)
-            if _is_valid_decoded_path(record, decoded):
-                valid_path_count += 1
-            if _solver_correct(record):
-                solver_correct_count += 1
 
-    return dag_reasoning_metrics(
-        total_nll_nats,
-        supervised_tokens,
-        sample_count,
-        config,
-        em_correct,
-        marginal_correct,
-        conditional_correct,
-        first_error_sum,
-        valid_path_count,
-        solver_correct_count,
+        generated = _generate_dag_targets(model, records, task, device, dtype)
+        for record, decoded in zip(records, generated, strict=True):
+            target = materialize_dag_task(record, task)["target_ids"]
+            if task == "outcome":
+                first_hop_correct += int(decoded == target)
+            else:
+                if stepwise_correct is None:
+                    stepwise_correct = [0] * len(target)
+                trace_em_correct += int(decoded == target)
+                for position, (prediction, expected) in enumerate(zip(decoded, target, strict=True)):
+                    stepwise_correct[position] += int(prediction == expected)
+                first_error_sum += _first_error_position(decoded, target)
+                valid_path_count += int(_is_valid_generated_trace(record, decoded))
+            solver_correct_count += int(_solver_correct(record))
+
+    total_nll_bits = total_nll_nats / math.log(2.0)
+    metrics: dict[str, object] = {
+        "task": task,
+        "teacher_forced_total_nll_bits": total_nll_bits,
+        "teacher_forced_nll_bits_per_token": total_nll_bits / supervised_tokens,
+        "teacher_forced_nll_bits_per_sample": total_nll_bits / sample_count,
+        "branching_reference_bits": config.H_L_bits,
+        "solver_em": solver_correct_count / sample_count,
+        "samples": sample_count,
+        "supervised_tokens": supervised_tokens,
+    }
+    if task == "outcome":
+        metrics.update(
+            first_hop_accuracy=first_hop_correct / sample_count,
+            random_choice_accuracy=1.0 / config.d,
+        )
+        return metrics
+
+    assert stepwise_correct is not None
+    target_length = len(stepwise_correct)
+    metrics.update(
+        free_run_trace_em=trace_em_correct / sample_count,
+        stepwise_accuracy=[count / sample_count for count in stepwise_correct],
+        first_error_position_mean=first_error_sum / sample_count,
+        path_validity_rate=valid_path_count / sample_count,
+        random_choice_trace_em=(1.0 / config.d) ** target_length,
     )
-
-
-def _first_error_position(decoded: Sequence[int], target: Sequence[int], L: int) -> int:
-    for position in range(L):
-        if decoded[position] != target[position]:
-            return position
-    return L
+    return metrics

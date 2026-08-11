@@ -62,7 +62,9 @@ class DagGenerationTests(unittest.TestCase):
         self.assertEqual(
             count_paths(edges, metadata["source"], metadata["target"]), 1
         )
-        self.assertEqual(record["target_ids"], metadata["path"][1:])
+        self.assertEqual(record["input_ids"][-1], 1024 + 8)
+        self.assertEqual(record["target_ids"], metadata["path"][1:-1])
+        self.assertEqual(metadata["branching_reference_bits"], config.H_L_bits)
 
         outdegree = {}
         for source, _ in edges:
@@ -91,7 +93,8 @@ class DagGenerationTests(unittest.TestCase):
 
         self.assertEqual(original_parsed["source"], reordered_parsed["source"])
         self.assertEqual(original_parsed["target"], reordered_parsed["target"])
-        self.assertEqual(original_parsed["answer"], reordered_parsed["answer"])
+        self.assertEqual(original_parsed["answer"], [])
+        self.assertEqual(reordered_parsed["answer"], [])
         self.assertEqual(
             set(original_parsed["edges"]), set(reordered_parsed["edges"])
         )
@@ -242,7 +245,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         record = json.loads(result.stdout)
         self.assertEqual(record["family"], "dag")
-        self.assertEqual(record["answer_length"], 2)
+        self.assertEqual(record["answer_length"], 1)
 
     def test_random_units_cli_writes_simple_train_and_test_folders(self):
         with tempfile.TemporaryDirectory() as temp_dir:

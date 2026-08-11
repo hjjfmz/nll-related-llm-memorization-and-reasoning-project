@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dag_units = subparsers.add_parser(
         "dag-units",
-        help="write fixed-size DAG train/test unit files",
+        help="write fixed-size DAG train/validation/test unit files",
     )
     dag_units.add_argument("--V", type=int, default=2048)
     dag_units.add_argument("--L", type=int, default=4)
@@ -91,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dag_units.add_argument("--unit-size", type=int, default=1_000)
     dag_units.add_argument("--train-units", type=int, required=True)
+    dag_units.add_argument("--validation-units", type=int, required=True)
     dag_units.add_argument("--test-units", type=int, required=True)
     dag_units.add_argument("--base-seed", type=int, default=20260715)
     dag_units.add_argument(
@@ -268,6 +269,7 @@ def command_dag_units(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         config=config,
         train_units=args.train_units,
+        validation_units=args.validation_units,
         test_units=args.test_units,
         unit_size=args.unit_size,
         base_seed=args.base_seed,
@@ -279,6 +281,7 @@ def command_dag_units(args: argparse.Namespace) -> int:
                 "dataset_root": str(args.output_dir.resolve()),
                 "manifest": str(manifest_path.resolve()),
                 "train_records": manifest["splits"]["train"]["records"],
+                "validation_records": manifest["splits"]["validation"]["records"],
                 "test_records": manifest["splits"]["test"]["records"],
             },
             ensure_ascii=False,

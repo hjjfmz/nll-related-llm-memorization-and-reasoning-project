@@ -15,16 +15,20 @@ class DagCommandError(ValueError):
 
 RESUME_LOCKED_FIELDS = {
     "model",
+    "task",
     "V",
     "L",
     "d",
     "W",
     "train_size",
+    "validation_size",
     "test_size",
     "dataset_root",
     "train_units",
+    "validation_units",
     "test_units",
     "train_seed",
+    "validation_seed",
     "test_seed",
     "sampling_seed",
     "model_seed",
@@ -59,6 +63,10 @@ def load_saved_run_arguments(run_dir: Path) -> dict[str, Any]:
     arguments = payload.get("arguments", payload)
     if not isinstance(arguments, dict):
         raise DagCommandError(f"invalid run config arguments: {path}")
+    if arguments.get("task") not in {"outcome", "trace"}:
+        raise DagCommandError(
+            "saved DAG run has no valid task; regenerate it with the dual-task E04 code"
+        )
     return dict(arguments)
 
 
@@ -145,7 +153,7 @@ def make_eval_namespace(
 
 def _namespace_from_arguments(arguments: Mapping[str, Any]) -> argparse.Namespace:
     parser = build_parser()
-    namespace = parser.parse_args([])
+    namespace = parser.parse_args(["--task", str(arguments.get("task", "outcome"))])
     for key, value in arguments.items():
         normalized_key = key.replace("-", "_")
         setattr(namespace, normalized_key, _coerce_value(normalized_key, value))
