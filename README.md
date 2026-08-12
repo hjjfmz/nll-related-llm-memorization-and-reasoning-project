@@ -1,636 +1,271 @@
-# 随机序列记忆容量实验说明
+# Phase C 实验指南
 
-当前默认协议与论文的随机容量设置对齐：每条样本是 `[BOS] y_1 ... y_64 [EOS]`，其中每个 `y_i` 独立均匀采样自 `V=2048` 个 token；全部 64 个随机 token 均接受因果 LM 监督。默认训练使用 Adam、bf16、无 weight decay、固定 `1,000,000` optimizer steps；双卡下 `micro-batch-size=8`、`gradient-accumulation=128` 对应全局 batch 2048。`bits_per_parameter` 使用总可训练参数量作分母，另保留 non-embedding 口径供诊断。
+本仓库包含两类从零训练的合成任务：
 
----
+- E03 `random`：随机序列记忆容量标定。它用于测量模型可压缩的训练集随机信息量。
+- E04 `dag`：同一 DAG 图分布上的双任务路径规划。它比较没有逐步轨迹监督的 `outcome` 与显式轨迹监督的 `trace`。
 
-## 1. 重构目的
+本 README 面向在远程服务器直接生成数据、训练、续训和评估的成员。所有命令从仓库根目录执行。
 
-原先代码可以训练随机序列，但数据是在训练时按 `sample_id` 在线生成的，文件夹里看不到实际数据集；模型 preset 也偏大，导致本阶段很难判断问题来自代码、数据规模、模型规模还是训练策略。
+## 1. 环境与入口
 
-本次重构解决三个问题：
+确认当前 Python 可用 CUDA：
 
-1. **模型规模对齐论文主实验范围**  
-   使用较小的 GPT-style from-scratch 模型网格，例如 `L1_H32`、`L4_H128`、`L8_H256` 等，删除 `350m/700m/1b` 这类本阶段不可控的大模型，仅保留 `120m_legacy` 作为历史对照。
+```bash
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
+```
 
-2. **数据显式落盘，保证可复现**  
-   随机序列数据按 `1k` 样本为一个 unit 写入 `.jsonl.gz` 文件。`train-units=5` 表示读取前 5 个 unit，即 5k 样本；`train-units=1000` 表示读取前 1000 个 unit，即 1M 样本。
-
-3. **为容量曲线服务**  
-   同一个模型 `P` 要扫描多个训练集规模 `N`，从欠拟合到饱和，最终观察：
-   - train NLL 是否随 `N` 和训练过程下降；
-   - test NLL 是否保持接近随机 baseline；
-   - `memory_bits` 是否随 `N` 上升后进入平台；
-   - `bits_per_parameter` 的平台值是否接近论文的 `3.6 bits/parameter`。
-
----
-
-## 2. 当前实验边界
-
-当前只做：
-
-- 纯随机序列；
-- from-scratch 训练；
-- NLL / memory_bits / bits_per_parameter 容量标定；
-- train/test 无泄漏检查；
-- 多 `N` 扫描。
-
-当前不做：
-
-- DAG 推理实验；
-- 混合随机 + DAG 训练；
-- `lambda` 深度惩罚；
-- CoT 实验；
-- 自动多 GPU 队列调度；
-- 论文图表最终绘制。
-
----
-
-## 3. 关键文件与新目录结构
-
-| 文件/目录 | 作用 |
-|---|---|
-| `phase_c/cli.py` | 新主入口，提供 `random` / `dag` 两个 family（各自 `train/resume/extend/eval/gen-data/inspect` 子命令） |
-| `phase_c/experiments/e03_random_capacity/config.py` | 实验 3 随机容量：运行配置加载、`resume/extend/eval` 参数构造与防呆 |
-| `phase_c/experiments/e03_random_capacity/commands.py` | 实验 3 随机容量：子命令分发 |
-| `phase_c/experiments/e03_random_capacity/train.py` | 实验 3 随机容量：训练主循环与 DDP 训练入口 |
-| `phase_c/experiments/e04_dag_reasoning/train.py` | 实验 4 DAG：训练主循环，含周期性 test 监控钩子（`eval_log.jsonl` 记录 grokking 信号） |
-| `phase_c/experiments/e04_dag_reasoning/config.py` | 实验 4 DAG：`resume/extend/eval` 参数构造与防呆 |
-| `phase_c/experiments/e04_dag_reasoning/commands.py` | 实验 4 DAG：子命令分发 |
-| `phase_c/experiments/e05_unified_analysis/` | 实验 5 统一账本分析（骨架占位，待实现） |
-| `phase_c/data/core.py` | 随机序列、DAG、admission、JSONL/GZIP 数据核心实现 |
-| `phase_c/data/cli.py` | 数据 preview/validate/write/random-units/dag-units 命令入口 |
-| `phase_c/data/random_units.py` | 固定 1k unit 随机数据集落盘与 manifest 生成 |
-| `phase_c/data/dag_units.py` | 固定 unit DAG 数据集落盘与 manifest 生成 |
-| `phase_c/models/config.py` | `ModelConfig` 定义与参数合法性检查 |
-| `phase_c/models/presets.py` | 论文对齐的小模型 preset 网格 |
-| `phase_c/models/transformer.py` | Decoder-only Transformer、attention、MLP、block 实现 |
-| `phase_c/models/counting.py` | total / embedding / non-embedding 参数量统计 |
-| `phase_c/models/inspect.py` | 查看模型 preset、参数量、non-embedding 参数 |
-| `phase_c/training/collation.py` | answer-only label 构造 |
-| `phase_c/training/datasets.py` | 在线/文件 unit 数据集（random 与 DAG 两套） |
-| `phase_c/training/stream.py` | 可恢复、可 DDP 分片的训练样本流 |
-| `phase_c/training/losses.py` | causal LM loss |
-| `phase_c/training/evaluation.py` | 随机容量（NLL/memory）与 DAG 推理（λ/EM/stepwise/path validity/边序对照）评估 |
-| `phase_c/training/checkpoint.py` | checkpoint 保存、加载、RNG 状态兼容恢复 |
-| `phase_c/training/common.py` | 共享训练辅助（DDP/device/LR/IO），供 E4+ 使用 |
-| `phase_c/experiments/e03_random_capacity/reporting.py` | 实验 3 随机容量结果绘图脚本 |
-| `generate_random_units.sh` | Linux/bash 下随机数据一键生成脚本 |
-| `generate_dag_units.sh` | Linux/bash 下 DAG 数据一键生成脚本 |
-| `phase_c/tests/test_phase_c_data.py` | 数据生成与 CLI 测试 |
-| `phase_c/tests/test_phase_c_training.py` | 模型、训练、checkpoint、文件数据集测试 |
-| `phase_c/tests/test_phase_c_random_cli.py` | 新主入口、resume/extend/eval 语义测试 |
-| `phase_c/tests/test_package_structure.py` | 防止包内重新依赖旧根目录模块的结构测试 |
-
-### 3.1 实验 ↔ 代码 映射（论文写作导航）
-
-对应 `project.md` 中的实验编号：
-
-| 实验 | 内容 | 代码位置 |
-|---|---|---|
-| 实验 0 | 冻结数据 contract | `phase_c/data/core.py`（`RandomConfig`/`DagConfig`、序列格式、metadata） |
-| 实验 1 | 数据与测量管线准入 | `phase_c/data/core.py`（`run_admission_checks`、`validate_record`）+ `phase_c/data/cli.py`（`validate` 命令） |
-| 实验 2 | 训练脚本 CPU smoke | `phase_c/training/` + `python -m phase_c.cli random train --max-steps 1 --device cpu` |
-| 实验 3 | 纯随机序列容量标定（已完成） | `phase_c/experiments/e03_random_capacity/`（`train/config/commands/reporting`） |
-| 实验 4 | 纯 DAG 推理极限测量（代码已就绪，待服务器跑） | `phase_c/experiments/e04_dag_reasoning/`（`train/config/commands`）+ `phase_c/data/dag_units.py` |
-| 实验 5 | 统一账本分析（待实现） | `phase_c/experiments/e05_unified_analysis/`（骨架占位） |
-
----
-
-## 4. 新主入口与运行模式
-
-推荐后续优先使用：
+主入口：
 
 ```bash
 python -m phase_c.cli random <command> ...
+python -m phase_c.cli dag <command> ...
 ```
 
-### 4.1 查看模型参数量
+单卡使用 `CUDA_VISIBLE_DEVICES=0 python ...`；双卡使用：
 
 ```bash
-python -m phase_c.cli random inspect --model L4_H128 --V 2048
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli dag <command> ...
 ```
 
-重点看：
+正常退出训练进程后，GPU 显存会由进程自动释放。不要让两个训练命令写入同一个 `--output-dir`。
 
-```text
-parameters.total
-```
+## 2. E03 随机容量实验（简要）
 
-### 4.2 生成随机 unit 数据
+E03 已完成主要代码重构。随机数据每个 unit 固定为 1000 个样本，`--train-units 10` 即固定读取 `train/1.jsonl.gz` 到 `train/10.jsonl.gz`，也就是 10k 样本。
+
+生成数据：
 
 ```bash
 python -m phase_c.cli random gen-data \
-  --V 2048 \
-  --S 64 \
-  --unit-size 1000 \
-  --train-units 1000 \
-  --test-units 20 \
+  --V 2048 --S 64 --unit-size 1000 \
+  --train-units 1000 --test-units 20 \
   --base-seed 20260715 \
   --output-dir phase_c_random_data/V2048_S64_seed20260715
 ```
 
-### 4.3 新实验
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random train \
-  --model L4_H128 \
-  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
-  --train-units 10 \
-  --test-units 5 \
-  --max-steps 1000000 \
-  --eval-size 0 \
-  --output-dir phase_c_runs/random_L4_H128_N10k_steps1m
-```
-
-### 4.4 中断后严格恢复
-
-`resume` 只恢复原实验，不允许改变训练定义参数。适合断电、SSH 断开、手动停训后继续原计划。
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random resume \
-  --run-dir phase_c_runs/random_L4_H128_N10k_steps1m
-```
-
-### 4.5 没到平台时追加训练
-
-`extend` 是显式追加训练，不再把“恢复中断”和“增加 epoch”混在一起。默认策略为 `constant-min`，即使用原实验的 `minimum_learning_rate` 固定小 LR 继续训练。
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random extend \
-  --run-dir phase_c_runs/random_L4_H128_N10k_steps1m \
-  --extra-steps 250000 \
-  --lr-policy constant-min \
-  --output-dir phase_c_runs/random_L4_H128_N10k_steps1m_extend001
-```
-
-### 4.6 手动停训后补最终评估
-
-如果训练被手动停掉，`final_metrics.json` 不会自动生成。使用 `eval` 从 checkpoint 补评估：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random eval \
-  --run-dir phase_c_runs/random_L4_H128_units10_e300 \
-  --eval-size 0 \
-  --output-dir phase_c_runs/random_L4_H128_units10_e300_eval
-```
-
-### 4.7 实验 4：DAG 推理极限测量（E4）
-
-三个命令：生成数据 → 训练（自动监控 grokking）→ 测指标。
-
-生成 DAG 数据（`W` 默认 `d+2`）：
-
-```bash
-python -m phase_c.cli dag gen-data \
-  --V 2048 --L 4 --d 2 \
-  --unit-size 1000 --train-units 100 --validation-units 10 --test-units 20 \
-  --base-seed 20260715 \
-  --output-dir phase_c_dag_data/V2048_L4_d2_seed20260715
-```
-
-训练（`--eval-interval` 控制监控频率，监控写进 `eval_log.jsonl`，可观察 test NLL 是否跌破随机基线 `H_R=L·log2(V)` 即 grokking）：
-
-```bash
-python -m phase_c.cli dag train \
-  --task outcome \
-  --model L4_H128 \
-  --dataset-root phase_c_dag_data/V2048_L4_d2_seed20260715 \
-  --train-units 100 --validation-units 10 --test-units 20 \
-  --max-steps 100000 \
-  --eval-interval 1000 --monitor-eval-size 2000 \
-  --output-dir phase_c_runs/dag_L4_H128_depth4_d2
-```
-
-测指标（λ / EM / stepwise / path validity，`--edge-reorder-seed` 输出边序重排对照）：
-
-```bash
-python -m phase_c.cli dag eval \
-  --run-dir phase_c_runs/dag_L4_H128_depth4_d2 \
-  --eval-size 0 --edge-reorder-seed 123 \
-  --output-dir phase_c_runs/dag_L4_H128_depth4_d2_eval
-```
-
-E4 在同一批图上配对运行两个任务：`outcome` 仅预测首跳，`trace` 预测中间节点。`final_metrics.json` 将 teacher-forced NLL 与 free-run 指标分开：outcome 输出 `first_hop_accuracy` 和 `random_choice_accuracy`；trace 输出 `free_run_trace_em`、`stepwise_accuracy`、`first_error_position_mean`、`path_validity_rate`。`branching_reference_bits` 仅为元数据；E4 不输出 `lambda` 或 `memory_bits`。
-
----
-
-## 5. 数据格式与目录
-
-修改后的模型preset集：
-
-```python
-MODEL_PRESETS = {
-    "debug": ModelConfig("debug", 2, 64, 1),
-    "L1_H32": ModelConfig("L1_H32", 1, 32, 1),
-    "L1_H64": ModelConfig("L1_H64", 1, 64, 1),
-    "L1_H128": ModelConfig("L1_H128", 1, 128, 2),
-    "L1_H256": ModelConfig("L1_H256", 1, 256, 4),
-    "L2_H32": ModelConfig("L2_H32", 2, 32, 1),
-    "L2_H64": ModelConfig("L2_H64", 2, 64, 1),
-    "L2_H128": ModelConfig("L2_H128", 2, 128, 2),
-    "L2_H256": ModelConfig("L2_H256", 2, 256, 4),
-    "L4_H32": ModelConfig("L4_H32", 4, 32, 1),
-    "L4_H64": ModelConfig("L4_H64", 4, 64, 1),
-    "L4_H128": ModelConfig("L4_H128", 4, 128, 2),
-    "L4_H256": ModelConfig("L4_H256", 4, 256, 4),
-    "L8_H32": ModelConfig("L8_H32", 8, 32, 1),
-    "L8_H64": ModelConfig("L8_H64", 8, 64, 1),
-    "L8_H128": ModelConfig("L8_H128", 8, 128, 2),
-    "L8_H256": ModelConfig("L8_H256", 8, 256, 4),
-    "L16_H32": ModelConfig("L16_H32", 16, 32, 1),
-    "L16_H64": ModelConfig("L16_H64", 16, 64, 1),
-    "L16_H128": ModelConfig("L16_H128", 16, 128, 2),
-    "L16_H256": ModelConfig("L16_H256", 16, 256, 4),
-    "120m_legacy": ModelConfig("120m_legacy", 12, 896, 14),
-}
-```
-
-默认随机序列设置：
-
-```text
-V = 2048
-S = 64
-unit_size = 1000
-base_seed = 20260715
-```
-
-每条样本的信息量为：
-
-```text
-H_R = S * log2(V) = 64 * 11 = 704 bits
-```
-
-默认数据目录：
-
-```text
-phase_c_random_data/
-  V2048_S64_seed20260715/
-    dataset_manifest.json
-    train/
-      1.jsonl.gz
-      2.jsonl.gz
-      ...
-    test/
-      1.jsonl.gz
-      2.jsonl.gz
-      ...
-```
-
-读取规则：
-
-```text
---train-units 1     -> train/1.jsonl.gz                         -> 1k
---train-units 5     -> train/1.jsonl.gz ... train/5.jsonl.gz     -> 5k
---train-units 100   -> train/1.jsonl.gz ... train/100.jsonl.gz   -> 100k
---train-units 1000  -> train/1.jsonl.gz ... train/1000.jsonl.gz  -> 1M
-```
-
-不同训练集规模是严格前缀关系：`1k` 是 `5k` 的子集，`5k` 是 `100k` 的子集，便于画同一数据分布下的容量曲线。
-
----
-
-## 6. 环境准备（可选）
-
-### Windows 本地
-
-推荐使用已有 conda 环境：
-
-```powershell
-python -c "import torch; print(torch.__version__)"
-```
-
-### Linux 服务器
-
-确认 Python 和 torch：
-
-```bash
-which python
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
-```
-
-多 GPU 训练应使用 `torchrun`，不要直接用 `python` 期望自动使用多卡。
-
----
-
-## 7. 生成数据
-
-### Windows PowerShell：生成 100k train + 20k test
-
-```powershell
-D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
-  --V 2048 `
-  --S 64 `
-  --unit-size 1000 `
-  --train-units 100 `
-  --test-units 20 `
-  --base-seed 20260715 `
-  --output-dir phase_c_random_data\V2048_S64_seed20260715
-```
-
-### Windows PowerShell：生成 1M train + 20k test
-
-```powershell
-D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
-  --V 2048 `
-  --S 64 `
-  --unit-size 1000 `
-  --train-units 1000 `
-  --test-units 20 `
-  --base-seed 20260715 `
-  --output-dir phase_c_random_data\V2048_S64_seed20260715
-```
-
-### Linux/bash：使用脚本生成
-
-默认生成 `1M train + 20k test`：
-
-```bash
-bash generate_random_units.sh
-```
-
-生成 `100k train + 20k test`：
-
-```bash
-bash generate_random_units.sh 100 20
-```
-
-指定 Python：
-
-```bash
-PYTHON_BIN=/path/to/python bash generate_random_units.sh 1000 20
-```
-
----
-
-## 8. 本地 smoke test
-
-### 7.1 单元测试
-
-```powershell
-D:\anaconda\envs\minimind\python.exe -m unittest phase_c.tests.test_phase_c_data phase_c.tests.test_phase_c_training phase_c.tests.test_phase_c_random_cli
-```
-
-通过标准：
-
-```text
-Ran 28 tests
-OK
-```
-
-### 7.2 极小数据 CPU smoke
-
-生成极小数据：
-
-```powershell
-D:\anaconda\envs\minimind\python.exe -m phase_c.cli random gen-data `
-  --V 32 `
-  --S 6 `
-  --unit-size 10 `
-  --train-units 2 `
-  --test-units 2 `
-  --base-seed 1234 `
-  --output-dir phase_c_random_data\smoke_V32_S6_seed1234
-```
-
-跑 1 step：
-
-```powershell
-D:\anaconda\envs\minimind\python.exe -m phase_c.cli random train `
-  --model debug `
-  --dataset-root phase_c_random_data\smoke_V32_S6_seed1234 `
-  --train-units 2 `
-  --test-units 2 `
-  --device cpu `
-  --dtype float32 `
-  --micro-batch-size 1 `
-  --gradient-accumulation 1 `
-  --max-steps 1 `
-  --eval-size 0 `
-  --eval-batch-size 1 `
-  --output-dir phase_c_runs\smoke_debug_1step
-```
-
-## 9. 正式训练
-
-### 单卡训练
+训练示例：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli random train \
   --model L4_H128 \
   --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
-  --train-units 100 \
-  --test-units 20 \
-  --max-steps 1000000 \
-  --eval-size 0 \
-  --output-dir phase_c_runs/random_L4_H128_units100
+  --train-units 10 --test-units 20 \
+  --max-steps 1000000 --eval-size 0 \
+  --output-dir phase_c_runs/random_L4_H128_N10k
 ```
 
-### 两卡 DDP 训练
+E03 重点看 `final_metrics.json` 的 train `memory_bits` 和 `bits_per_parameter`。随机 test 的 NLL 应接近随机基线，不应被当作泛化成功。
+
+## 3. E04 双任务是什么
+
+每个样本都是一张分层 DAG，输入 prompt 固定为：
+
+```text
+[BOS] [GRAPH] u1 v1 u2 v2 ... [QUERY] s t [ANSWER]
+```
+
+图、起点 `s`、终点 `t` 都已给出；正确路径不在输入中。设路径有 `L` 条边、`L+1` 个节点：
+
+- `outcome`：只预测第一跳 `p1`。这是主任务，模型必须从图中做出下一步规划，没有真实路径 token 可供 teacher forcing。
+- `trace`：预测中间节点 `p1 ... p(L-1)`，但不重复输出已知终点 `t`。这是显式轨迹监督对照。
+
+同一组 outcome 和 trace 必须使用完全相同的 `V/L/d/W`、数据根目录、train/validation/test units、模型、种子、优化和训练预算。唯一变化是 `--task` 和输出目录。
+
+`L=4` 表示从 `s` 到 `t` 有 4 条边：outcome 的目标长度为 1，trace 的目标长度为 3。`d` 是每个节点的出度；`W` 是每层节点数，默认 `d+2`。
+
+## 4. E04 完整操作流程
+
+### 4.1 生成固定 DAG 数据
+
+先一次性生成共享 canonical 数据。三个 split 必须同时生成：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random train \
-  --model L4_H128 \
-  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
-  --train-units 100 \
-  --test-units 20 \
-  --max-steps 1000000 \
-  --eval-size 0 \
-  --output-dir phase_c_runs/random_L4_H128_units100
+python -m phase_c.cli dag gen-data \
+  --V 2048 --L 4 --d 2 --W 4 \
+  --unit-size 1000 \
+  --train-units 100 --validation-units 10 --test-units 20 \
+  --base-seed 20260715 \
+  --output-dir phase_c_dag_data/V2048_L4_d2_W4_seed20260715
 ```
 
-### 1M 数据训练示例
+目录应包含：
+
+```text
+phase_c_dag_data/V2048_L4_d2_W4_seed20260715/
+  dataset_manifest.json
+  train/1.jsonl.gz ... train/100.jsonl.gz
+  validation/1.jsonl.gz ... validation/10.jsonl.gz
+  test/1.jsonl.gz ... test/20.jsonl.gz
+```
+
+文件数据带 manifest 和 SHA256 校验。训练时如果文件被改动、配置不一致或 split 不匹配，会直接报错。`--train-units 10` 总是取前 10 个 train unit，因此 10k 是 100k 的严格前缀，便于比较不同训练规模。
+
+服务器可用脚本生成：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli random train \
-  --model L4_H128 \
-  --dataset-root phase_c_random_data/V2048_S64_seed20260715 \
-  --train-units 1000 \
-  --test-units 20 \
-  --max-steps 1000000 \
-  --eval-size 0 \
-  --output-dir phase_c_runs/random_L4_H128_units1000
+# 参数顺序：train units、validation units、test units、output dir
+PYTHON_BIN=python bash generate_dag_units.sh 100 10 20 \
+  phase_c_dag_data/V2048_L4_d2_W4_seed20260715
 ```
 
-`--eval-size 0` 表示最终完整评估整个 train/test split。正式算容量时建议使用 `0`；快速调试时可以临时改成 `10000`。
+脚本的 `V/L/D/UNIT_SIZE/BASE_SEED` 可通过环境变量覆盖；未设置 `W` 时使用默认 `d+2`。
 
----
+### 4.2 训练 outcome 主任务
 
-## 10. 推荐扫描网格
-
-第一轮不建议一口气跑满所有组合。推荐从小规模确认趋势：
-
-```text
-models = L1_H64, L2_H128, L4_H128, L8_H256
-train_units = 1, 2, 5, 10, 30, 100, 300, 1000
-test_units = 20
-```
-
-每个模型固定参数量 `P`，扫描多个 `N`：
-
-```text
-N = train_units * 1000
-```
-
-目标是得到同一模型下 `NLL / memory_bits / bits_per_parameter` 随 `N` 增长的曲线。
-
----
-
-## 11. 输出文件
-
-每次训练会在 `--output-dir` 下写出：
-
-```text
-run_config.json
-train_log.jsonl
-checkpoint_latest.pt
-final_metrics.json
-```
-
-重点看：
-
-```text
-final_metrics.json
-```
-
-核心字段：
-
-```json
-{
-  "train": {
-    "nll_bits_per_token": 0.0,
-    "dataset_entropy_bits": 0.0,
-    "memory_bits": 0.0,
-    "bits_per_parameter": 0.0,
-    "samples": 0
-  },
-  "test": {
-    "nll_bits_per_token": 0.0,
-    "samples": 0
-  },
-  "parameters": {
-    "total": 0
-  },
-  "formal_capacity_evaluation": true
-}
-```
-
----
-
-## 12. 验收标准
-
-### 代码链路验收
-
-必须满足：
-
-- 单元测试通过；
-- `random-units` 能生成 `train/` 和 `test/` 的 `.jsonl.gz` 文件；
-- 训练脚本能通过 `--dataset-root` 读取文件数据；
-- CPU smoke 能生成 `final_metrics.json`；
-- `train.samples` 与 `train-units * unit_size` 一致；
-- `test.samples` 与 `test-units * unit_size` 一致。
-
-### 数据正确性验收
-
-必须满足：
-
-- `dataset_manifest.json` 存在；
-- train/test 使用不同 split；
-- 不同 `train_units` 之间是前缀关系；
-- `test` 不与 `train` 共用同一批样本；
-- `V/S/base_seed/unit_size` 在 manifest 中可追踪。
-
-### 实验合理性验收
-
-对于随机序列任务：
-
-- train NLL 应能下降；
-- test NLL 应接近随机 baseline；
-- 若 `V=1024`，test baseline 约为 `10 bits/token`；
-- 若 `V=32`，test baseline 约为 `5 bits/token`；
-- test NLL 明显低于 baseline 时，应优先怀疑数据泄漏或评估 bug；
-- 小数据 smoke 的 `bits_per_parameter` 不应拿来和 `3.6` 比较。
-
-### 容量标定验收
-
-要声称复现 Morris 风格容量，需要满足：
-
-1. 对同一个模型 `P`，扫描多个 `N`；
-2. 数据总熵覆盖从欠拟合到接近/超过模型容量的范围；
-3. `memory_bits` 随 `N` 上升后出现平台；
-4. 平台值除以总可训练参数量得到稳定的 `bits_per_parameter`；
-5. 多个模型规模的容量平台近似线性随 `P` 增长；
-6. 拟合得到的 `alpha` 与论文 `~3.6 bits/parameter` 在合理误差内。
-
----
-
-## 13. 常见误区
-
-### 误区 1：小 smoke 的 `bits_per_parameter` 很低，所以代码不对
-
-不一定。若数据总熵太小，即使模型完美记住，`bits_per_parameter` 也不可能接近 `3.6`。
-
-上限为：
-
-```text
-max_bits_per_parameter = dataset_entropy_bits / total_parameters
-```
-
-### 误区 2：test loss 不下降是坏事
-
-不是。随机序列没有可泛化结构，test loss 应接近随机 baseline。  
-如果 test loss 明显下降，反而需要排查泄漏。
-
-### 误区 3：`train-units` 是训练 batch size
-
-不是。`train-units` 是数据文件数量：
-
-```text
-train-units = 1000 -> 1000 个文件 -> 1M 样本
-```
-
-训练 batch 由下面两个参数控制：
-
-```text
---micro-batch-size
---gradient-accumulation
-```
-
-### 误区 4：直接用 `python` 就能多 GPU
-
-不能。多 GPU 要用：
+单卡：
 
 ```bash
-torchrun --standalone --nproc_per_node=2
+CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli dag train \
+  --task outcome --model L4_H128 \
+  --dataset-root phase_c_dag_data/V2048_L4_d2_W4_seed20260715 \
+  --train-units 100 --validation-units 10 --test-units 20 \
+  --max-steps 100000 \
+  --micro-batch-size 8 --gradient-accumulation 128 \
+  --eval-interval 1000 --monitor-eval-size 2000 \
+  --eval-size 0 \
+  --output-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k
 ```
 
----
+双卡仅替换命令前缀，其他参数不变：
 
-## 14. 推送前检查
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m phase_c.cli dag train \
+  --task outcome --model L4_H128 \
+  --dataset-root phase_c_dag_data/V2048_L4_d2_W4_seed20260715 \
+  --train-units 100 --validation-units 10 --test-units 20 \
+  --max-steps 100000 \
+  --micro-batch-size 8 --gradient-accumulation 128 \
+  --eval-interval 1000 --monitor-eval-size 2000 \
+  --eval-size 0 \
+  --output-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k
+```
 
-```powershell
-D:\anaconda\envs\minimind\python.exe -m unittest phase_c.tests.test_phase_c_data phase_c.tests.test_phase_c_training phase_c.tests.test_phase_c_random_cli
+### 4.3 训练 trace 对照任务
+
+复制 outcome 命令，只改 `--task trace` 和输出目录。其余训练定义必须相同：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli dag train \
+  --task trace --model L4_H128 \
+  --dataset-root phase_c_dag_data/V2048_L4_d2_W4_seed20260715 \
+  --train-units 100 --validation-units 10 --test-units 20 \
+  --max-steps 100000 \
+  --micro-batch-size 8 --gradient-accumulation 128 \
+  --eval-interval 1000 --monitor-eval-size 2000 \
+  --eval-size 0 \
+  --output-dir phase_c_runs/e04_trace_L4_H128_L4_d2_N100k
+```
+
+### 4.4 运行中看什么
+
+训练输出写入 `--output-dir`：
+
+```text
+run_config.json          # 完整参数和任务类型
+train_log.jsonl          # 训练 loss、学习率、梯度范数
+eval_log.jsonl           # 周期性 validation 指标
+checkpoint_latest.pt     # 最新 checkpoint
+final_metrics.json       # 训练正常结束后的 train/validation/test 结果
+```
+
+周期监控只读 validation，绝不使用 test 来挑 checkpoint 或判断是否继续训练。
+
+- outcome：在 `eval_log.jsonl` 看 `first_hop_accuracy`。随机选择基线是 `1/d`，例如 `d=2` 时为 0.5。
+- trace：看 `free_run_trace_em` 和 `path_validity_rate`。它们是真实自回归生成指标，不会把真实路径 token 喂回模型。
+- 两个任务都可看 `teacher_forced_nll_bits_per_token`，但不要把它当作 free-run 成功率。
+
+`final_metrics.json` 只在训练正常结束时写入。若手动中断，先确认已有 `checkpoint_latest.pt`，再运行 `dag eval` 补全最终指标。
+
+### 4.5 中断、恢复与加长训练
+
+`resume`：原计划被中断后严格恢复。它读取 run config 和 checkpoint，不能改 task、数据、模型和训练定义参数。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli dag resume \
+  --run-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k
+```
+
+`extend`：原训练已经结束或明确想继续更久时使用。它以保存的 `minimum_learning_rate` 固定小学习率追加训练，避免重新按总步数计算 scheduler 导致学习率跳变。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli dag extend \
+  --run-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k \
+  --extra-steps 25000 \
+  --lr-policy constant-min \
+  --output-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k_extend001
+```
+
+说明：E04 双任务重构前的旧 DAG run 没有保存 `task`，不能用新命令续训；请重新生成正式数据并重新开始 E04 run。
+
+### 4.6 最终评估与边序对照
+
+对完整 test split 做最终评估，并测试模型是否依赖边在 prompt 中的排列顺序：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m phase_c.cli dag eval \
+  --run-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k \
+  --eval-size 0 --edge-reorder-seed 123 \
+  --output-dir phase_c_runs/e04_outcome_L4_H128_L4_d2_N100k_eval
+```
+
+结果中的 `test_edge_reordered` 与 `test` 对比：若 free-run 指标明显下降，说明模型可能利用了边的序列顺序，不能把结果直接解释为稳定的图规划能力。
+
+## 5. E04 指标解释与最小验收
+
+`branching_reference_bits=L*log2(d)` 只是分支参考量，用于记录配置；它不是条件熵下界，也不与参数记忆容量放在同一个账本中。E04 不输出 `lambda` 或 `memory_bits`。
+
+| 任务 | 主指标 | 对照基线 | 辅助指标 |
+|---|---|---|---|
+| outcome | `first_hop_accuracy` | `random_choice_accuracy=1/d` | teacher-forced NLL、`solver_em` |
+| trace | `free_run_trace_em` | `random_choice_trace_em=(1/d)^(L-1)` | `stepwise_accuracy`、`first_error_position_mean`、`path_validity_rate`、`solver_em` |
+
+一次配对实验至少检查：
+
+1. 两个 run 的 `run_config.json` 除 `task`、`output_dir` 外训练定义相同。
+2. 两者使用同一数据根目录及相同 unit 数；验证集只用于训练监控。
+3. `solver_em` 应为 1.0；否则先检查数据生成或评估实现。
+4. outcome 高于 `1/d` 才说明模型学到非随机首跳决策。
+5. trace 同时报告 EM、逐位置准确率和合法路径率，不能只报告 teacher-forced NLL。
+6. 边序重排后结果不能出现无法解释的大幅下降。
+
+## 6. 训练前 Smoke Test
+
+提交到服务器或改代码后，先在 CPU 跑完整回归：
+
+```bash
+python -m unittest discover -s phase_c/tests -p "test_*.py"
+```
+
+E04 极小 smoke：
+
+```bash
+python -m phase_c.cli dag train \
+  --task outcome --model debug \
+  --V 64 --L 3 --d 2 --W 4 \
+  --train-size 20 --validation-size 10 --test-size 10 \
+  --device cpu --dtype float32 \
+  --micro-batch-size 1 --gradient-accumulation 1 \
+  --max-steps 1 --eval-size 0 --eval-interval 0 \
+  --output-dir phase_c_runs/e04_smoke_outcome
+```
+
+该 smoke 只验证数据、训练、free-run 评估和结果写盘，不能用于判断模型能力。
+
+## 7. 常用排查
+
+- `--task` 缺失：E04 必须明确指定 `outcome` 或 `trace`。
+- `dataset-root requires ... units`：文件数据训练必须同时提供 train、validation、test 的 unit 数。
+- `DAG unit does not match manifest`：数据文件被覆盖、截断或混用了另一个数据根目录；重新生成该目录。
+- `final_metrics.json` 缺失：训练被中断；用 `dag eval --run-dir ...` 从最新 checkpoint 补评估。
+- CUDA RNG 设备数报错：新代码只恢复当前可见 GPU 的 RNG state；请确认服务器使用的是更新后的仓库。
+- 多卡未启动：必须使用 `torchrun --nproc_per_node=<卡数>`，不能只给普通 `python` 设置多个 `CUDA_VISIBLE_DEVICES`。
+
+## 8. 推送前检查
+
+```bash
+python -m unittest discover -s phase_c/tests -p "test_*.py"
 git status
 ```
 
-不要直接 `git add .`，避免把临时数据、训练输出、旧图脚本误提交。
-
-建议提交：
-
-```powershell
-git add README.md generate_random_units.sh phase_c
-git commit -m "refactor: add file-backed random capacity workflow"
-git push -u origin codex/random-capacity-refactor
-```
-
----
-
-## 15. 下一步计划
-
-当前阶段完成后，再进入：
-
-1. 训练多模型、多 `N` 容量曲线；
-2. 汇总 `final_metrics.json`；
-3. 画 `NLL vs N`、`memory_bits vs N`、`bits_per_parameter vs N`；
-4. 拟合容量密度 `alpha`；
-5. 再开始 DAG 推理实验。
+不要执行 `git add .`，避免提交 `phase_c_dag_data/`、`phase_c_runs/` 或 checkpoint。
